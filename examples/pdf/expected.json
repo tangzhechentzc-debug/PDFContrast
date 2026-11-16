@@ -1,0 +1,688 @@
+{
+  "description": "Text and scan variants contain identical visible data. Scan PDFs contain no text objects.",
+  "font": "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+  "page_size_points": [
+    595.2755905511812,
+    841.8897637795277
+  ],
+  "rotation": 0,
+  "scan_render_scale": 3,
+  "header": [
+    "编号",
+    "名称",
+    "金额"
+  ],
+  "match_key": "编号",
+  "expected_content_changes": [
+    {
+      "kind": "value_changed",
+      "key": "A001",
+      "field": "金额",
+      "old": "12000.00",
+      "new": "12800.00",
+      "delta": "800.00"
+    },
+    {
+      "kind": "value_changed",
+      "key": "A002",
+      "field": "金额",
+      "old": "1.231",
+      "new": "1.234",
+      "delta": "0.003"
+    },
+    {
+      "kind": "row_removed",
+      "key": "A003"
+    },
+    {
+      "kind": "row_added",
+      "key": "A007"
+    }
+  ],
+  "matched_keys": [
+    "A001",
+    "A002",
+    "A004",
+    "A005",
+    "A006"
+  ],
+  "unchanged_keys": [
+    "A004",
+    "A005",
+    "A006"
+  ],
+  "cross_page_keys": [
+    "A001",
+    "A004"
+  ],
+  "source_truth": {
+    "old": {
+      "A001": {
+        "page_index": 0,
+        "page_number": 1,
+        "table_row_index": 1,
+        "cells": {
+          "编号": {
+            "value": "A001",
+            "bbox_top_origin": [
+              48,
+              204,
+              152,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              593.8897637795277,
+              152,
+              637.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "设备采购",
+            "bbox_top_origin": [
+              152,
+              204,
+              392,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              593.8897637795277,
+              392,
+              637.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "12000.00",
+            "bbox_top_origin": [
+              392,
+              204,
+              547,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              593.8897637795277,
+              547,
+              637.8897637795277
+            ]
+          }
+        }
+      },
+      "A002": {
+        "page_index": 0,
+        "page_number": 1,
+        "table_row_index": 2,
+        "cells": {
+          "编号": {
+            "value": "A002",
+            "bbox_top_origin": [
+              48,
+              248,
+              152,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              549.8897637795277,
+              152,
+              593.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "精度校准",
+            "bbox_top_origin": [
+              152,
+              248,
+              392,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              549.8897637795277,
+              392,
+              593.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "1.231",
+            "bbox_top_origin": [
+              392,
+              248,
+              547,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              549.8897637795277,
+              547,
+              593.8897637795277
+            ]
+          }
+        }
+      },
+      "A003": {
+        "page_index": 0,
+        "page_number": 1,
+        "table_row_index": 3,
+        "cells": {
+          "编号": {
+            "value": "A003",
+            "bbox_top_origin": [
+              48,
+              292,
+              152,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              505.8897637795277,
+              152,
+              549.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "咨询服务",
+            "bbox_top_origin": [
+              152,
+              292,
+              392,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              505.8897637795277,
+              392,
+              549.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "500.00",
+            "bbox_top_origin": [
+              392,
+              292,
+              547,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              505.8897637795277,
+              547,
+              549.8897637795277
+            ]
+          }
+        }
+      },
+      "A004": {
+        "page_index": 1,
+        "page_number": 2,
+        "table_row_index": 1,
+        "cells": {
+          "编号": {
+            "value": "A004",
+            "bbox_top_origin": [
+              48,
+              204,
+              152,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              593.8897637795277,
+              152,
+              637.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "安装工程",
+            "bbox_top_origin": [
+              152,
+              204,
+              392,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              593.8897637795277,
+              392,
+              637.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "3000.00",
+            "bbox_top_origin": [
+              392,
+              204,
+              547,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              593.8897637795277,
+              547,
+              637.8897637795277
+            ]
+          }
+        }
+      },
+      "A005": {
+        "page_index": 1,
+        "page_number": 2,
+        "table_row_index": 2,
+        "cells": {
+          "编号": {
+            "value": "A005",
+            "bbox_top_origin": [
+              48,
+              248,
+              152,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              549.8897637795277,
+              152,
+              593.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "日常耗材",
+            "bbox_top_origin": [
+              152,
+              248,
+              392,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              549.8897637795277,
+              392,
+              593.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "250.00",
+            "bbox_top_origin": [
+              392,
+              248,
+              547,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              549.8897637795277,
+              547,
+              593.8897637795277
+            ]
+          }
+        }
+      },
+      "A006": {
+        "page_index": 1,
+        "page_number": 2,
+        "table_row_index": 3,
+        "cells": {
+          "编号": {
+            "value": "A006",
+            "bbox_top_origin": [
+              48,
+              292,
+              152,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              505.8897637795277,
+              152,
+              549.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "设备维护",
+            "bbox_top_origin": [
+              152,
+              292,
+              392,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              505.8897637795277,
+              392,
+              549.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "900.00",
+            "bbox_top_origin": [
+              392,
+              292,
+              547,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              505.8897637795277,
+              547,
+              549.8897637795277
+            ]
+          }
+        }
+      }
+    },
+    "new": {
+      "A004": {
+        "page_index": 0,
+        "page_number": 1,
+        "table_row_index": 1,
+        "cells": {
+          "编号": {
+            "value": "A004",
+            "bbox_top_origin": [
+              48,
+              204,
+              152,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              593.8897637795277,
+              152,
+              637.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "安装工程",
+            "bbox_top_origin": [
+              152,
+              204,
+              392,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              593.8897637795277,
+              392,
+              637.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "3000.00",
+            "bbox_top_origin": [
+              392,
+              204,
+              547,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              593.8897637795277,
+              547,
+              637.8897637795277
+            ]
+          }
+        }
+      },
+      "A002": {
+        "page_index": 0,
+        "page_number": 1,
+        "table_row_index": 2,
+        "cells": {
+          "编号": {
+            "value": "A002",
+            "bbox_top_origin": [
+              48,
+              248,
+              152,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              549.8897637795277,
+              152,
+              593.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "精度校准",
+            "bbox_top_origin": [
+              152,
+              248,
+              392,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              549.8897637795277,
+              392,
+              593.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "1.234",
+            "bbox_top_origin": [
+              392,
+              248,
+              547,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              549.8897637795277,
+              547,
+              593.8897637795277
+            ]
+          }
+        }
+      },
+      "A007": {
+        "page_index": 0,
+        "page_number": 1,
+        "table_row_index": 3,
+        "cells": {
+          "编号": {
+            "value": "A007",
+            "bbox_top_origin": [
+              48,
+              292,
+              152,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              505.8897637795277,
+              152,
+              549.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "新增备件",
+            "bbox_top_origin": [
+              152,
+              292,
+              392,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              505.8897637795277,
+              392,
+              549.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "750.00",
+            "bbox_top_origin": [
+              392,
+              292,
+              547,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              505.8897637795277,
+              547,
+              549.8897637795277
+            ]
+          }
+        }
+      },
+      "A006": {
+        "page_index": 1,
+        "page_number": 2,
+        "table_row_index": 1,
+        "cells": {
+          "编号": {
+            "value": "A006",
+            "bbox_top_origin": [
+              48,
+              204,
+              152,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              593.8897637795277,
+              152,
+              637.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "设备维护",
+            "bbox_top_origin": [
+              152,
+              204,
+              392,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              593.8897637795277,
+              392,
+              637.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "900.00",
+            "bbox_top_origin": [
+              392,
+              204,
+              547,
+              248
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              593.8897637795277,
+              547,
+              637.8897637795277
+            ]
+          }
+        }
+      },
+      "A001": {
+        "page_index": 1,
+        "page_number": 2,
+        "table_row_index": 2,
+        "cells": {
+          "编号": {
+            "value": "A001",
+            "bbox_top_origin": [
+              48,
+              248,
+              152,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              549.8897637795277,
+              152,
+              593.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "设备采购",
+            "bbox_top_origin": [
+              152,
+              248,
+              392,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              549.8897637795277,
+              392,
+              593.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "12800.00",
+            "bbox_top_origin": [
+              392,
+              248,
+              547,
+              292
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              549.8897637795277,
+              547,
+              593.8897637795277
+            ]
+          }
+        }
+      },
+      "A005": {
+        "page_index": 1,
+        "page_number": 2,
+        "table_row_index": 3,
+        "cells": {
+          "编号": {
+            "value": "A005",
+            "bbox_top_origin": [
+              48,
+              292,
+              152,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              48,
+              505.8897637795277,
+              152,
+              549.8897637795277
+            ]
+          },
+          "名称": {
+            "value": "日常耗材",
+            "bbox_top_origin": [
+              152,
+              292,
+              392,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              152,
+              505.8897637795277,
+              392,
+              549.8897637795277
+            ]
+          },
+          "金额": {
+            "value": "250.00",
+            "bbox_top_origin": [
+              392,
+              292,
+              547,
+              336
+            ],
+            "bbox_pdf_user_space": [
+              392,
+              505.8897637795277,
+              547,
+              549.8897637795277
+            ]
+          }
+        }
+      }
+    }
+  }
+}

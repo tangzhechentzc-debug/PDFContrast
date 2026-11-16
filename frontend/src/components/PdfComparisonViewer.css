@@ -1,0 +1,59 @@
+.full-page-viewer { min-width: 0; padding: .75rem 1rem; }
+.original-toolbar, .page-view-options { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .65rem; }
+.original-toolbar { justify-content: space-between; }
+.evidence-views { display: flex; gap: .25rem; flex-wrap: wrap; align-items: center; }
+.evidence-views button { padding: .3rem .6rem; }
+.original-toolbar .inline-label { flex-wrap: nowrap; gap: .35rem; font-size: .8rem; }
+.original-toolbar select { width: auto; padding: .25rem; }
+.full-page-viewer .source-addresses { margin: .5rem 0; gap: .25rem .75rem; }
+.full-page-viewer .source-addresses span { border: 0; padding: 0; }
+.source-side.old strong { color: var(--info); }
+.source-side.new strong { color: var(--accent); }
+.crop-unavailable { margin: .3rem 0; }
+.full-page-controls { display: grid; grid-template-columns: minmax(0, 1.5fr) repeat(2, minmax(0, 1fr)); align-items: end; gap: .5rem; margin: .5rem 0; }
+.full-page-controls > label { display: grid; gap: .15rem; font-size: .8rem; min-width: 0; }
+.full-page-controls select { width: 100%; min-width: 0; padding: .35rem; font-size: .82rem; }
+.page-view-options button { padding: .25rem .55rem; }
+.overlay-opacity { font-size: .8rem; display: flex; align-items: center; gap: .5rem; }
+.overlay-opacity input { accent-color: var(--accent); padding: .2rem; max-width: 45vw; }
+.paper-size-labels { display: flex; flex-wrap: wrap; gap: .125rem .75rem; margin: .5rem 0 .25rem; font-size: .8rem; font-variant-numeric: tabular-nums; }
+.paper-label.old { color: var(--info); }
+.paper-label.new { color: var(--accent); }
+.full-page-scroll { height: clamp(22rem, 56vh, 40rem); overflow: auto; position: relative; padding: 12px; margin-top: .35rem; border: 1px solid var(--border); background: color-mix(in srgb, var(--text) 8%, var(--bg)); }
+.full-page-stage { position: relative; margin: 0 auto; }
+.physical-paper { position: absolute; background: #fff; line-height: 0; }
+.physical-paper.old { outline: 1px solid var(--info); }
+.physical-paper.new { outline: 1px solid var(--accent); }
+.physical-paper img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.paper-loading { position: absolute; top: .65rem; left: .65rem; line-height: 1.5; font-size: .8rem; color: #333; }
+.paper-image-error { position: sticky; top: 0; left: 0; width: min(14rem, 100%); padding: .6rem; line-height: 1.5; color: #72291d; background: #fff; font-size: .8rem; }
+.paper-image-error button { display: block; margin-top: .35rem; color: var(--text); }
+.full-page-highlight { position: absolute; border: 2px solid var(--info); background: color-mix(in srgb, var(--info) 12%, transparent); pointer-events: none; }
+.physical-paper.new .full-page-highlight { border-color: var(--accent); }
+.full-page-highlight.reference-region { border: 2px dashed #666; background: transparent; }
+.manual-pages { margin: .5rem 0 0; font-size: .8rem; }
+.manual-pages summary { cursor: pointer; }
+.manual-pages .full-page-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.original-downloads { display: flex; flex-wrap: wrap; gap: .4rem .75rem; margin-top: .5rem; }
+.pdf-detail-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+.pdf-detail-side { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); }
+.pdf-detail-side h4 { margin: 0; padding: .35rem .5rem; font-size: .8rem; border-bottom: 1px solid var(--border); }
+.pdf-detail-side.old h4 { color: var(--info); }
+.pdf-detail-side.new h4 { color: var(--accent); }
+.pdf-detail-scroll { overflow: auto; height: 11rem; background: var(--bg); }
+.pdf-detail-crop { position: relative; overflow: hidden; background: #fff; }
+.pdf-detail-crop img { position: absolute; max-width: none; display: block; }
+.pdf-detail-outline { position: absolute; outline: 2px solid var(--info); pointer-events: none; }
+.pdf-detail-side.new .pdf-detail-outline { outline-color: var(--accent); }
+.pdf-detail-outline.reference-region { outline: 2px dashed #666; }
+.pdf-detail-unavailable { margin: 0; padding: .75rem; }
+
+@media (max-width: 650px) {
+  .full-page-viewer { padding: .75rem; }
+  .full-page-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .full-page-controls > label:first-child { grid-column: 1/-1; }
+  .manual-pages .full-page-controls > label:first-child { grid-column: auto; }
+  .full-page-scroll { height: min(32rem, 75vh); }
+  .pdf-detail-pair { grid-template-columns: minmax(0, 1fr); }
+  .pdf-detail-scroll { height: 9rem; }
+}

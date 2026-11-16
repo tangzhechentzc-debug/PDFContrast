@@ -1,0 +1,25 @@
+import type { ReportIssue, ResultLocation, Run, Side } from '../types';
+import { reportSource } from './PdfReportOverview';
+
+const labels: Record<string, string> = { attribute_unverified: '属性验证未完成', identity: '业务身份待确认', inventory: '报表结构与清单问题', pairing: '配对待确认', extraction: '提取问题', structure: '表格结构问题', unclassified_region: '未归类区域', non_report_scope: '非业务文档范围', source_body_empty: '原表正文为空', document_scope: '非业务文档范围', region_unresolved: '局部内容尚未恢复', extraction_unavailable: '提取失败', extraction_failed: '提取失败', match_ambiguous: '匹配不确定', pairing_uncertain: '配对待确认', report_match_uncertain: '报表实例待确认', object_unknown: '业务对象未确认', unknown_identity: '业务身份未确认', structure_unconfirmed: '表格结构待修复', ocr_review: '扫描内容待核验', ocr_suspected: '识别内容疑似差异', excluded: '未比较范围', excluded_scope: '未比较范围', unmapped_columns: '未映射字段', unclassified: '其他提示' };
+
+export default function PdfIssueGroups({ run, busy, onLocate, onConfigure, onReview, onReprocess, onShowIssues, collapsed = false }: { run: Run; busy: boolean; onLocate: (location: ResultLocation) => void; onConfigure: () => void; onReview: () => void; onReprocess: () => void; onShowIssues: (reportId?: string) => void; collapsed?: boolean }) {
+  const grouped = new Map<string, ReportIssue[]>();
+  for (const issue of run.issues ?? []) grouped.set(issue.type, [...(grouped.get(issue.type) ?? []), issue]);
+  function locate(issue: ReportIssue, sourceIndex?: number) {
+    const source = sourceIndex == null ? undefined : issue.sources[sourceIndex];
+    const side: Side | undefined = source?.side ?? issue.side;
+    const report = run.reports?.find(item => issue.report_ids.includes(item.id));
+    const belongsToReport = source && side && source.page && report?.[side]?.pages.includes(source.page);
+    onLocate({ id: `${issue.id}:${sourceIndex ?? 'report'}`, report_id: !source || belongsToReport ? report?.id : undefined,
+      title: labels[issue.type] ?? '待处理区域', message: issue.message,
+      old_source: source ? side === 'old' ? source : null : reportSource(report?.old ?? null),
+      new_source: source ? side === 'new' ? source : null : reportSource(report?.new ?? null) });
+  }
+  return <section className="issue-groups" aria-label="提取与匹配待处理区域"><div className="section-heading"><div><h2>提取与匹配待处理区域</h2><p className="muted">按类型查看影响范围。处理后须重新比较，当前结果和导出仍保留原判定。</p></div><button onClick={() => onShowIssues()}>查看全部待确认记录</button></div>
+    {[...grouped.entries()].map(([type, issues]) => { const pages = new Set(issues.flatMap(issue => issue.pages.map(page => `${issue.side ?? '未标版本'}:${page}`))); const reportIds = new Set(issues.flatMap(issue => issue.report_ids)); return <details key={type} className="issue-group" open={!collapsed}><summary>{labels[type] ?? '其他待处理问题'} · {issues.length} 条 · 涉及 {reportIds.size} 个报表 / {pages.size} 个页面位置</summary>{issues.map(issue => <article key={issue.id}><p>{issue.message}</p><p className="muted small">{issue.side ? issue.side === 'old' ? '旧版' : '新版' : '跨版本或未指定版本'}{issue.pages.length ? ` · 第 ${issue.pages.join('、')} 页` : ''}{issue.report_ids.length ? ` · ${issue.report_ids.map(id => run.reports?.find(report => report.id === id)?.title ?? '关联报表').join('、')}` : ' · 尚未归属业务报表'}</p><div className="actions">{issue.sources.map((source, i) => { const side = source.side ?? issue.side; return side ? <button key={i} onClick={() => locate(issue, i)}>查看{side === 'old' ? '旧版' : '新版'}第 {source.page ?? '?'} 页原文</button> : null; })}{!issue.side && !issue.sources.some(source => source.side) && issue.report_ids.length > 0 && <button onClick={() => locate(issue)}>查看关联报表原文</button>}<button onClick={() => onShowIssues(issue.report_ids.length === 1 ? issue.report_ids[0] : undefined)}>相关待确认记录</button>{issue.actions.some(action => /pair|config|match|identity/.test(action)) && <button disabled={busy} onClick={onConfigure}>确认配对与规则</button>}{issue.actions.some(action => !/pair|config|match|identity/.test(action) && /review|correct|structure|verify/.test(action)) && <button disabled={busy} onClick={onReview}>校正与核验</button>}{issue.actions.some(action => /reprocess|retry|extract/.test(action)) && <button disabled={busy} onClick={onReprocess}>重新处理原件（新任务）</button>}</div></article>)}</details>; })}
+    {run.issues && !run.issues.length && <p className="empty">本次结果没有结构化待处理问题；原始范围提示仍保留如下。</p>}
+    <details className="coverage-details"><summary>全部原始提示与未比较范围（保留证据） · {run.coverage.warnings.length} 条提示</summary><div className="coverage-content"><p>旧版未比较：{run.coverage.excluded_sheets.old.join('、') || '无记录'}；新版未比较：{run.coverage.excluded_sheets.new.join('、') || '无记录'}。</p>{run.coverage.warnings.length > 0 ? <ul>{run.coverage.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul> : <p>没有额外原始提示。</p>}</div></details>
+    <div className="toolbar"><div className="actions"><button disabled={busy} onClick={onConfigure}>确认配对与比较规则</button><button disabled={busy} onClick={onReview}>校正与核验 OCR</button><button disabled={busy} onClick={onReprocess}>重新处理两份原件（新任务）</button></div><p className="muted small">重新处理会生成新的导入任务；原始文件、校正历史与已有结果保留。</p></div>
+  </section>;
+}
