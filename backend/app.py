@@ -1,5 +1,4 @@
 import hashlib
-import io
 import json
 import logging
 import math
@@ -20,18 +19,18 @@ from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
 import pdfplumber
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .compare import compare_workbooks
 from .excel import extract_workbook, sheet_columns, sheet_region, suggest_pairs
+from .export import EXCEL_EXPORT_MAX_ROWS, export_report as _export_report, source_label
 from .models import CompareConfig, ReviewAction
 from .pdf import extract_pdf, compare_pdfs, suggest_pdf_pairs, MAX_PAGE_PIXELS, _RENDER_LOCK
 from .review import apply_reviews, review_catalog, structure_tables, structure_table, prepare_structure_event
+
+_DEFAULT_EXCEL_EXPORT_MAX_ROWS = EXCEL_EXPORT_MAX_ROWS
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -44,7 +43,45 @@ def encode(value):
 
 
 def public_pdf_pages(book):
-    return [{key: value for key, value in page.items() if key != "appearance"} for page in book.get("pages", [])]
+    fields = {
+        "number", "width", "height", "physical_width", "physical_height", "image_width", "image_height",
+        "rotation", "media_box", "crop_box", "method", "status", "blank", "has_graphics",
+        "ocr_unverified", "reviewed", "reviewable", "reviewed_cells", "total_cells", "structure_unconfirmed",
+    }
+    return [{**{key: value for key, value in page.items() if key in fields},
+             "has_native_text": bool(page.get("has_native_text") or page.get("native_lines") or page.get("native_text"))}
+            for page in book.get("pages", [])]
+
+
+def public_paragraph_check(check):
+    source_fields = {
+        "sheet", "cell", "range", "kind", "page", "bbox", "highlight_boxes", "location_granularity",
+        "location_reason", "method", "confidence", "manual", "location_precision", "precision", "side",
+    }
+    fields = {"attribute", "status", "message", "old_value", "new_value"}
+    return {**{key: value for key, value in check.items() if key in fields},
+            **{f"{side}_source": ({key: value for key, value in check[f"{side}_source"].items()
+                                  if key in source_fields} if check.get(f"{side}_source") else None)
+               for side in ("old", "new")}}
+
+
+def public_run(run):
+    result = dict(run)
+    if "reports" in run:
+        result["reports"] = []
+        for report in run["reports"]:
+            public_report = {key: value for key, value in report.items() if key != "paragraph_checks"}
+            if "paragraph_checks" in report:
+                checks = report["paragraph_checks"]
+                public_report["paragraph_check_summary"] = {
+                    "total": len(checks),
+                    **{status: sum(check.get("status") == status for check in checks)
+                       for status in ("changed", "unchanged", "unverified")}}
+            result["reports"].append(public_report)
+    if "review_pages" in run:
+        result["review_pages"] = {side: public_pdf_pages({"pages": pages})
+                                  for side, pages in run["review_pages"].items()}
+    return result
 
 
 def structure_revision(events):
@@ -131,7 +168,9 @@ class Store:
 
     def workbook(self, job_id: str, side: str):
         self.job(job_id)
-        book = json.loads((self.folder / job_id / f"{side}.json").read_text())
+        book = json.loads((self.folder / job_id / f"{side}.json").read_text(encoding="utf-8"))
+        if book.get("asset_storage") == "page_files_v1":
+            book["asset_directory"] = str((self.folder / job_id / f"{side}-pages").resolve())
         book["review_namespace"] = f"{job_id}:{side}"
         return book
 
@@ -143,17 +182,46 @@ class Store:
         events = [json.loads(row[0]) for row in rows]
         return (events[-1]["revision"] if events else 0), events
 
-    def reviewed_book(self, job_id, side, events):
-        return apply_reviews(self.workbook(job_id, side), [e for e in events if e["side"] == side])
+    def reviewed_book(self, job_id: str, side: str, events: list[dict] | None = None, rebuild_inventory: bool = True) -> dict:
+        book = self.workbook(job_id, side)
+        side_events = [event for event in (events or []) if event["side"] == side]
+        native_unmodified = (
+            not side_events and book.get("report_inventory_version", 0) >= 2 and "reports" in book and
+            all(page.get("method") == "text" and not page.get("structure_unconfirmed") for page in book.get("pages", [])) and
+            all(not cell.get("requires_review") and cell.get("pdf_source", {}).get("method") != "ocr"
+                for sheet in book["sheets"] for cell in sheet["cells"].values()))
+        if native_unmodified:
+            # 本次请求新加载的副本，无共享证据引用被修改
+            for page in book.get("pages", []):
+                page.update(reviewed=False, reviewable=False, total_cells=0, reviewed_cells=0)
+            for sheet in book["sheets"]:
+                sheet["nonempty_count"] = sum(cell["value"] is not None for cell in sheet["cells"].values())
+            return book
+        # 仅在显式跳过重建时传入关键字参数，保持对 2 参测试桩的兼容
+        if rebuild_inventory:
+            return apply_reviews(book, side_events)
+        return apply_reviews(book, side_events, rebuild_inventory=False)
 
     def current_job(self, job_id):
         job = self.job(job_id)
         if job.get("kind") != "pdf":
             return job
-        revision, events = self.reviews(job_id)
+        with self.connect() as db:
+            rows = db.execute("SELECT payload FROM review_events WHERE job_id=? ORDER BY revision", (job_id,)).fetchall()
+        events = [json.loads(row[0]) for row in rows]
+        revision = events[-1]["revision"] if events else 0
+        if (not events and "suggested_pairs" in job and
+                all("pages" in job["files"][side] and "sheets" in job["files"][side] for side in ("old", "new"))):
+            for side in ("old", "new"):
+                job["files"][side]["pages"] = public_pdf_pages(job["files"][side])
+                job["files"][side]["sheets"] = [
+                    {key: value for key, value in sheet.items() if key not in ("cells", "merged_ranges", "cell_geometry")}
+                    for sheet in job["files"][side]["sheets"]]
+            job.update(review_revision=0, structure_revision=0)
+            return job
         books = {side: self.reviewed_book(job_id, side, events) for side in ("old", "new")}
         for side, book in books.items():
-            job["files"][side]["sheets"] = [{k: v for k, v in sheet.items() if k not in ("cells", "merged_ranges")}
+            job["files"][side]["sheets"] = [{k: v for k, v in sheet.items() if k not in ("cells", "merged_ranges", "cell_geometry")}
                                               for sheet in book["sheets"]]
             job["files"][side]["pages"] = public_pdf_pages(book)
             if book.get("report_inventory_version"):
@@ -170,36 +238,47 @@ class Store:
         if self.job(job_id).get("kind") != "pdf":
             raise ValueError("仅 PDF 任务支持 OCR 校正与核验")
         original = self.workbook(job_id, request.side)
+        revision, events = self.reviews(job_id)
+        if request.expected_revision != revision:
+            raise HTTPException(409, "当前内容已被其他操作更新，请加载最新状态后重新提交；草稿未保存")
+        side_events = [e for e in events if e["side"] == request.side]
+        # 在写锁外完成单次状态回放与全量校验，缩短数据库写锁持有时间
+        current = apply_reviews(original, side_events, rebuild_inventory=False)
+        event = request.model_dump(exclude={"expected_revision"}, exclude_none=True)
+        event.update(revision=revision + 1, created_at=datetime.now(timezone.utc).isoformat())
+        if request.action == "table_update":
+            event = prepare_structure_event(current, event)
+        elif request.action.startswith("cell_"):
+            target = next((item for item in review_catalog(current) if item["id"] == request.target_id), None)
+            if target is None:
+                raise ValueError("没有找到此任务及版本对应的 OCR 单元格")
+            if request.page is not None and request.page != target["page"]:
+                raise ValueError("目标单元格与页面不一致")
+            if request.action == "cell_update" and request.value is None:
+                raise ValueError("请提供校正文本；清空请提交空字符串")
+            event.update(page=target["page"], sheet=target["sheet"], cell=target["cell"],
+                         original_text=target["original_text"], before_text=target["current_text"],
+                         after_text=request.value if request.action == "cell_update" else target["current_text"])
+        elif request.target_id is not None or request.page is None:
+            raise ValueError("整页核验必须提供页面，且不能指定单元格")
+        if request.action != "cell_update" and request.value is not None:
+            raise ValueError("只有校正操作可以提交文本")
+        if request.action in ("page_verify", "page_unverify"):
+            page = next((item for item in current.get("pages", []) if item.get("number") == request.page), None)
+            if not page or page.get("method") != "ocr":
+                raise ValueError("没有找到可核验的 OCR 页面。")
+            if request.action == "page_verify" and not page.get("reviewable"):
+                raise ValueError("该页提取失败或结构尚未确认，不能通过文字核验将整页标为已确认。")
+        encoded_event = encode(event)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT payload FROM review_events WHERE job_id=? ORDER BY revision", (job_id,)).fetchall()
-            events = [json.loads(row[0]) for row in rows]
-            revision = events[-1]["revision"] if events else 0
-            if request.expected_revision != revision:
+            latest = db.execute(
+                "SELECT COALESCE(MAX(revision), 0) FROM review_events WHERE job_id=?",
+                (job_id,),
+            ).fetchone()[0]
+            if request.expected_revision != latest:
                 raise HTTPException(409, "当前内容已被其他操作更新，请加载最新状态后重新提交；草稿未保存")
-            side_events = [e for e in events if e["side"] == request.side]
-            current = apply_reviews(original, side_events)
-            event = request.model_dump(exclude={"expected_revision"}, exclude_none=True)
-            event.update(revision=revision + 1, created_at=datetime.now(timezone.utc).isoformat())
-            if request.action == "table_update":
-                event = prepare_structure_event(current, event)
-            elif request.action.startswith("cell_"):
-                target = next((item for item in review_catalog(current) if item["id"] == request.target_id), None)
-                if target is None:
-                    raise ValueError("没有找到此任务及版本对应的 OCR 单元格")
-                if request.page is not None and request.page != target["page"]:
-                    raise ValueError("目标单元格与页面不一致")
-                if request.action == "cell_update" and request.value is None:
-                    raise ValueError("请提供校正文本；清空请提交空字符串")
-                event.update(page=target["page"], sheet=target["sheet"], cell=target["cell"],
-                             original_text=target["original_text"], before_text=target["current_text"],
-                             after_text=request.value if request.action == "cell_update" else target["current_text"])
-            elif request.target_id is not None or request.page is None:
-                raise ValueError("整页核验必须提供页面，且不能指定单元格")
-            if request.action != "cell_update" and request.value is not None:
-                raise ValueError("只有校正操作可以提交文本")
-            apply_reviews(original, [*side_events, event])
-            db.execute("INSERT INTO review_events VALUES (?,?,?)", (job_id, event["revision"], encode(event)))
+            db.execute("INSERT INTO review_events VALUES (?,?,?)", (job_id, event["revision"], encoded_event))
         return {"revision": event["revision"], "event": event}
 
 
@@ -261,9 +340,10 @@ def ingest(store, job_id, files, progress=None, parent_job_id=None):
         except Exception as exc:
             logger.warning("Document parsing failed (%s)", type(exc).__name__)
             raise ValueError("无法解析文件，请检查是否损坏、加密或包含不支持的内容") from exc
-        (folder / f"{side}.json").write_text(encode(books[side]))
+        with (folder / f"{side}.json").open("w", encoding="utf-8") as stream:
+            json.dump(books[side], stream, ensure_ascii=False, allow_nan=False)
         files[side]["sheets"] = [
-            {k: v for k, v in sheet.items() if k not in ("cells", "merged_ranges")}
+            {k: v for k, v in sheet.items() if k not in ("cells", "merged_ranges", "cell_geometry")}
             for sheet in books[side]["sheets"]
         ]
         if kind == "pdf":
@@ -350,200 +430,10 @@ def execute_comparison(store, job_id, config):
     return result
 
 
-def source_label(source):
-    if not source:
-        return ""
-    if source.get("kind") == "pdf":
-        if source.get("manual"):
-            return f"第 {source['page']} 页 · {source.get('sheet', '整页')} · 人工补录，仅定位整页"
-        return f"第 {source['page']} 页 · {source.get('sheet', '原页')} · 区域 {source.get('bbox', [0, 0, 1, 1])}"
-    return f"{source['sheet']}!{source.get('range') or source['cell']}"
-
-
-def export_report(store, run_id):
-    run = store.run(run_id)
-    job = store.job(run["job_id"])
-    full_report = run.get("report_inventory_version", 0) >= 2
-    category_labels = {"content": "内容", "structure": "结构", "format": "格式", "layout": "版式", "completeness": "完整性"}
-    book = Workbook()
-    summary = book.active
-    summary.title = "摘要"
-    summary.append(["项目", "内容"])
-    for label, value in [
-        ("旧版", job["files"]["old"]["name"]), ("新版", job["files"]["new"]["name"]),
-        ("状态", "部分完成/待核对" if run["status"] == "completed_with_issues" else "比较完成"),
-        ("变化事件", run["summary"]["changes"]), ("待核对事件", run["summary"]["issues"]),
-        ("旧版 SHA-256", job["files"]["old"]["sha256"]), ("新版 SHA-256", job["files"]["new"]["sha256"]),
-        ("说明", "以完整业务报表比较内容、结构、格式与版式；原始物理尺寸和渲染证据保留，未验证属性单列，不等于一致；原件未修改" if full_report else
-         "PDF 按提取内容比较；OCR 结果和疑似差异需核对原图，未比较图形外观；原件未修改" if job.get("kind") == "pdf" else "公式结果来自文件缓存，未重新计算；原件未修改"),
-    ]:
-        summary.append([label, value])
-    detail = book.create_sheet("全部差异")
-    issues = book.create_sheet("待核对")
-    header = ["类型", "报表", "项目/业务键", "字段", "旧值", "新值", "差额", "旧位置", "新位置", "说明"]
-    if full_report:
-        header = ["类别", "判定", *header]
-    detail.append(header)
-    issues.append(header)
-    reliable = None
-    category_sheets = {}
-    if "reports" in run:
-        inventory = book.create_sheet("报表完整性")
-        inventory.append(["报表类型", "报表名称", "工程对象", "归类", "判定", "旧页范围", "新页范围", "依据", "阻塞原因", "内容比较状态", "全部变化数" if full_report else "内容变化数"] +
-                         (["内容摘要", "结构摘要", "格式摘要", "版式摘要"] if full_report else []))
-        presence_labels = {"shared": "共有", "old_only": "仅旧版", "new_only": "仅新版", "uncertain": "待确认"}
-        for report in run["reports"]:
-            sides = [report.get(side) or {} for side in ("old", "new")]
-            single_sided = bool(report.get("old")) != bool(report.get("new"))
-            confirmation = ("确认缺失" if report.get("confirmation") == "confirmed" else "待确认缺失") if single_sided else (
-                "已确认" if report.get("confirmation") == "confirmed" else "待确认")
-            inventory.append([report.get("type_code"), report.get("title"),
-                              encode(report.get("object")) if isinstance(report.get("object"), dict) else report.get("object"),
-                              presence_labels.get(report.get("presence"), report.get("presence")),
-                              confirmation,
-                              ", ".join(map(str, sides[0].get("pages", []))), ", ".join(map(str, sides[1].get("pages", []))),
-                              report.get("basis"), "；".join(report.get("blocking_reasons", [])),
-                              report.get("content_status"), report.get("change_count", 0)] +
-                             ([report.get("dimensions", {}).get(category, {}).get("summary", "当次未计算")
-                               for category in ("content", "structure", "format", "layout")] if full_report else []))
-        types = book.create_sheet("报表类型覆盖")
-        types.append(["归类", "类型代码", "名称", "旧版页", "新版页"])
-        for category, entries in run.get("type_inventory", {}).items():
-            if not isinstance(entries, list):
-                continue
-            for entry in entries:
-                types.append([presence_labels.get(category, category), entry.get("type_code"), entry.get("title"),
-                              ", ".join(map(str, entry.get("old_pages", []))), ", ".join(map(str, entry.get("new_pages", [])))])
-        pending = book.create_sheet("提取与配对问题")
-        pending.append(["问题类型", "说明", "影响报表", "版本", "页", "来源", "处理入口"])
-        for issue in run.get("issues", []):
-            pending.append([issue.get("type"), issue.get("message"), ", ".join(issue.get("report_ids", [])),
-                            issue.get("side"), ", ".join(map(str, issue.get("pages", []))),
-                            "；".join(source_label(source) for source in issue.get("sources", [])),
-                            ", ".join(issue.get("actions", []))])
-        if full_report:
-            for category in ("content", "structure", "format", "layout"):
-                category_sheets[category] = book.create_sheet(f"{category_labels[category]}差异")
-                category_sheets[category].append(header)
-            validation = book.create_sheet("属性验证范围")
-            validation.append(["报表编号", "报表名称", "类别", "状态", "变化数", "待核验数", "摘要", "限制与未支持属性"])
-            page_pairs = book.create_sheet("原页对应")
-            page_pairs.append(["报表编号", "报表名称", "旧版物理页", "新版物理页", "配页状态", "依据"])
-            paragraph_evidence = None
-            if any("paragraph_checks" in report for report in run["reports"]):
-                paragraph_evidence = book.create_sheet("段落测量证据")
-                paragraph_evidence.append(["报表编号", "报表名称", "属性", "状态", "旧侧结果", "新侧结果", "旧位置", "新位置", "依据与限制", "原始测量证据"])
-            dimensions_labels = {"changed": "存在差异", "unchanged": "已比较属性未发现变化", "partial": "部分已验证",
-                                 "unverified": "待确认／未验证", "not_applicable": "不适用"}
-            for report in run["reports"]:
-                for category in ("content", "structure", "format", "layout"):
-                    dimension = report.get("dimensions", {}).get(category, {})
-                    validation.append([report.get("type_code"), report.get("title"), category_labels[category],
-                                       dimensions_labels.get(dimension.get("status"), "当次未计算"), dimension.get("changes"), dimension.get("issues"),
-                                       dimension.get("summary"), "；".join(dimension.get("limitations", []))])
-                for pair in report.get("page_pairs", []):
-                    page_pairs.append([report.get("type_code"), report.get("title"), pair.get("old_page"), pair.get("new_page"),
-                                       "已对应" if pair.get("status") == "confirmed" else "待确认", pair.get("basis")])
-                for check in report.get("paragraph_checks", []):
-                    paragraph_evidence.append([
-                        report.get("type_code"), report.get("title"),
-                        {"line_spacing": "实际段落行距", "alignment": "左／中／右对齐"}.get(check.get("attribute"), check.get("attribute")),
-                        dimensions_labels.get(check.get("status"), "待确认／未验证"), check.get("old_value"), check.get("new_value"),
-                        source_label(check.get("old_source")), source_label(check.get("new_source")), check.get("message"),
-                        encode(check.get("measurements", {}))])
-        else:
-            reliable = book.create_sheet("可靠共有报表内容差异")
-            reliable.append(header)
-        scopes = book.create_sheet("非报表文档范围")
-        scopes.append(["版本", "范围类别", "物理页", "依据", "来源"])
-        scope_labels = {"blank_page": "空白或仅页码", "document_section": "文档正文", "continuation_note": "报表续注", "unclassified_region": "未确定文档区域"}
-        for region in run.get("non_report_regions", []):
-            scopes.append(["旧版" if region.get("side") == "old" else "新版",
-                           scope_labels.get(region.get("type"), region.get("type")),
-                           ", ".join(map(str, region.get("pages", []))), region.get("basis"), source_label(region.get("source"))])
-    elif job.get("kind") == "pdf":
-        summary.append(["报表完整性", "该历史结果尚无业务报表完整性判定；请重新提取后比较"])
-    with store.connect() as db:
-        for (payload,) in db.execute("SELECT payload FROM diffs WHERE run_id=? ORDER BY seq", (run_id,)):
-            d = json.loads(payload)
-            row = [d["kind"], d["table_name"], d["row_key"], d["field"], d["old_value"], d["new_value"],
-                   d["delta"], source_label(d["old_source"]), source_label(d["new_source"]), d["message"]]
-            if full_report:
-                row = [category_labels.get(d.get("category"), "待确认"), "待核验" if d["severity"] == "issue" else "存在差异", *row]
-            detail.append(row)
-            if d["severity"] == "issue":
-                issues.append(row)
-            if reliable is not None and d.get("layer") == "content" and d["severity"] != "issue":
-                reliable.append(row)
-            if d.get("category") in category_sheets:
-                category_sheets[d["category"]].append(row)
-    rules = book.create_sheet("范围与规则")
-    rules.append(["类别", "设置"])
-
-    def append_rule(path, value):
-        if isinstance(value, dict) and value:
-            for key, child in value.items():
-                append_rule(f"{path}.{key}", child)
-        elif isinstance(value, list) and value:
-            for index, child in enumerate(value):
-                append_rule(f"{path}[{index}]", child)
-        else:
-            text = encode(value)
-            if len(text) <= 30000:
-                rules.append([path, text])
-            else:
-                parts = [text[i:i + 30000] for i in range(0, len(text), 30000)]
-                for index, part in enumerate(parts, 1):
-                    rules.append([f"{path}（片段 {index}/{len(parts)}，按顺序拼接）", part])
-
-    for name in ("config", "coverage"):
-        append_rule(name, run[name])
-    for name in ("reports", "issues", "type_inventory", "non_report_regions"):
-        if name in run:
-            append_rule(name, run[name])
-    if job.get("kind") == "pdf":
-        revision = run.get("review_revision", 0)
-        summary.append(["OCR 核验修订号", revision])
-        if job.get("parent_job_id"):
-            summary.append(["重新提取来源任务", job["parent_job_id"]])
-            summary.append(["历史修订说明", "原任务的人工修订及历史结果仍保留；重新提取后的区域需重新核验，未自动迁移旧坐标修订"])
-        history = book.create_sheet("OCR修改记录")
-        history.append(["修订", "版本", "操作", "页面", "表", "单元格", "原始文本", "修改前", "修改后", "原因", "时间"])
-        _, events = store.reviews(job["id"], revision)
-        for event in events:
-            history.append([event.get(key, "") for key in ("revision", "side", "action", "page", "sheet", "cell",
-                                                            "original_text", "before_text", "after_text", "reason", "created_at")])
-        structures = [event for event in events if event["action"] == "table_update"]
-        if structures:
-            structural_detail = book.create_sheet("结构修改明细")
-            structural_detail.append(["修订", "版本", "页面", "表", "阶段", "坐标", "当前文本", "原始识别文本", "稳定标识", "来源", "原因", "时间"])
-            for event in structures:
-                for field, phase in (("table_before", "修改前"), ("table_after", "修改后")):
-                    snapshot = event[field]
-                    for row_index, row in enumerate(snapshot["rows"], 1):
-                        for column_index, cell in enumerate(row, 1):
-                            source = {**cell.get("source", {}), "sheet": snapshot["sheet"]}
-                            structural_detail.append([event["revision"], event["side"], event["page"], snapshot["sheet"],
-                                                      phase, f"{get_column_letter(column_index)}{row_index}", cell["text"],
-                                                      cell.get("original_text", ""), cell["id"], source_label(source),
-                                                      event["reason"], event["created_at"]])
-    for sheet in book:
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        for row in sheet:
-            for cell in row:
-                if isinstance(cell.value, str):
-                    cell.data_type = "s"
-        for cell in sheet[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="545E59")
-        for column in sheet.columns:
-            sheet.column_dimensions[column[0].column_letter].width = min(
-                65, max(14, max(len(str(c.value or "")) for c in column) + 2))
-    buffer = io.BytesIO()
-    book.save(buffer)
-    buffer.seek(0)
-    return buffer
+def export_report(store, run_id: str):
+    # 仅当模块级 EXCEL_EXPORT_MAX_ROWS 被测试覆写时显式传参，否则交由 backend.export 动态读取
+    max_rows = EXCEL_EXPORT_MAX_ROWS if EXCEL_EXPORT_MAX_ROWS != _DEFAULT_EXCEL_EXPORT_MAX_ROWS else None
+    return _export_report(store, run_id, max_rows=max_rows)
 
 
 def create_app(data_dir: Path | None = None):
@@ -561,12 +451,17 @@ def create_app(data_dir: Path | None = None):
     app = FastAPI(title="报表对比", version="0.2.0", docs_url="/api/docs", openapi_url="/api/openapi.json", lifespan=lifespan)
     app.state.store = store
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]", "testserver"])
+    dist = ROOT / "frontend" / "dist"
+    has_dist = dist.is_dir()
 
     @app.middleware("http")
     async def local_requests(request: Request, call_next):
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin")
-            allowed = {request.headers.get("host"), "localhost:5173", "127.0.0.1:5173"}
+            allowed = {request.headers.get("host")}
+            # 仅在未生成生产静态构建（开发态 Vite）时放行 5173 端口来源
+            if not has_dist:
+                allowed.update({"localhost:5173", "127.0.0.1:5173"})
             if origin and urlsplit(origin).netloc not in allowed:
                 return JSONResponse({"detail": "请从本机报表对比页面发起操作"}, status_code=403)
             try:
@@ -678,7 +573,7 @@ def create_app(data_dir: Path | None = None):
                 header_start: int = Query(1, ge=1), header_end: int = Query(1, ge=1),
                 cell_range: str | None = Query(None, alias="range"), review_revision: int | None = Query(None, ge=0)):
         _, events = store.reviews(job_id, review_revision)
-        book = store.reviewed_book(job_id, side, events) if store.job(job_id).get("kind") == "pdf" else store.workbook(job_id, side)
+        book = store.reviewed_book(job_id, side, events, rebuild_inventory=False) if store.job(job_id).get("kind") == "pdf" else store.workbook(job_id, side)
         return sheet_columns(book, sheet, header_start, header_end, cell_range or None)
 
     @app.get("/api/jobs/{job_id}/review")
@@ -687,12 +582,12 @@ def create_app(data_dir: Path | None = None):
         if store.job(job_id).get("kind") != "pdf":
             raise ValueError("仅 PDF 任务支持 OCR 校正与核验")
         revision, events = store.reviews(job_id)
-        book = store.reviewed_book(job_id, side, events)
+        book = store.reviewed_book(job_id, side, events, rebuild_inventory=False)
         items = [item for item in review_catalog(book) if page is None or item["page"] == page]
         return {"revision": revision,
                 "structure_revision": structure_revision(events),
                 "items": items[offset:offset + limit], "total": len(items),
-                "offset": offset, "limit": limit, "pages": book["pages"]}
+                "offset": offset, "limit": limit, "pages": public_pdf_pages(book)}
 
     @app.get("/api/jobs/{job_id}/review-tables")
     def review_tables(job_id: str, side: Literal["old", "new"], page: int | None = Query(None, ge=1),
@@ -700,7 +595,7 @@ def create_app(data_dir: Path | None = None):
         if store.job(job_id).get("kind") != "pdf":
             raise ValueError("仅 PDF 任务支持 OCR 表格结构调整")
         revision, events = store.reviews(job_id)
-        book = store.reviewed_book(job_id, side, events)
+        book = store.reviewed_book(job_id, side, events, rebuild_inventory=False)
         tables = [item for item in structure_tables(book) if page is None or item["page"] == page]
         result = {"revision": revision,
                   "structure_revision": structure_revision(events),
@@ -726,24 +621,76 @@ def create_app(data_dir: Path | None = None):
     def runs(job_id: str):
         store.job(job_id)
         with store.connect() as db:
-            rows = db.execute("SELECT metadata FROM runs WHERE job_id=? ORDER BY rowid DESC", (job_id,)).fetchall()
-        return {"items": [json.loads(row[0]) for row in rows]}
+            # 仅提取历史列表所需的轻量摘要字段，避免整册反序列化 reports 与测量证据
+            rows = db.execute(
+                "SELECT id, job_id, "
+                "json_extract(metadata, '$.status'), "
+                "json_extract(metadata, '$.review_revision'), "
+                "json_extract(metadata, '$.report_inventory_version'), "
+                "json_extract(metadata, '$.created_at'), "
+                "json_extract(metadata, '$.summary'), "
+                "json_type(metadata, '$.summary') "
+                "FROM runs WHERE job_id=? ORDER BY rowid DESC",
+                (job_id,),
+            ).fetchall()
+        items = []
+        for run_id, run_job_id, status, review_rev, inventory_ver, created_at, summary_value, summary_type in rows:
+            item = {"id": run_id, "job_id": run_job_id}
+            if status is not None:
+                item["status"] = status
+            if review_rev is not None:
+                item["review_revision"] = review_rev
+            if inventory_ver is not None:
+                item["report_inventory_version"] = inventory_ver
+            if created_at is not None:
+                item["created_at"] = created_at
+            if summary_value is not None:
+                # 仅对象与数组在 json_extract 下以 JSON 文本返回，标量类型直接保留原值
+                item["summary"] = json.loads(summary_value) if summary_type in ("object", "array") else summary_value
+            items.append(item)
+        return {"items": items}
 
     @app.post("/api/jobs/{job_id}/runs", status_code=201)
     async def compare(job_id: str, config: CompareConfig):
         store.job(job_id)
-        return await run_in_threadpool(execute_comparison, store, job_id, config.model_dump())
+        result = await run_in_threadpool(execute_comparison, store, job_id, config.model_dump())
+        return public_run(result)
 
     @app.get("/api/runs/{run_id}")
     def run(run_id: str):
-        return store.run(run_id)
+        return public_run(store.run(run_id))
+
+    @app.get("/api/runs/{run_id}/paragraph-checks")
+    def paragraph_checks(run_id: str, report_id: str, offset: int = Query(0, ge=0),
+                         limit: int = Query(100, ge=1, le=100)):
+        with store.connect() as db:
+            if not db.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone():
+                raise HTTPException(404, "找不到此比较结果")
+            report = db.execute(
+                "SELECT json_array_length(report.value, '$.paragraph_checks') "
+                "FROM runs, json_each(runs.metadata, '$.reports') AS report "
+                "WHERE runs.id=? AND json_extract(report.value, '$.id')=?", (run_id, report_id)).fetchone()
+            if report is None:
+                raise HTTPException(404, "找不到此报表的段落检查")
+            total = report[0] or 0
+            rows = db.execute(
+                "SELECT checks.value FROM runs, json_each(runs.metadata, '$.reports') AS report, "
+                "json_each(report.value, '$.paragraph_checks') AS checks "
+                "WHERE runs.id=? AND json_extract(report.value, '$.id')=? "
+                "ORDER BY CAST(checks.key AS INTEGER) LIMIT ? OFFSET ?",
+                (run_id, report_id, limit, offset)).fetchall() if offset < total else []
+        return {"items": [public_paragraph_check(json.loads(row[0])) for row in rows],
+                "total": total, "offset": offset, "limit": limit}
 
     @app.get("/api/runs/{run_id}/diffs")
     def differences(run_id: str, offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500),
                     kind: str = "all", q: str = "", report_id: str | None = None,
-                    layer: Literal["all", "completeness", "content", "structure", "format", "layout", "uncertainty"] = "all",
-                    category: Literal["all", "completeness", "content", "structure", "format", "layout"] = "all"):
-        store.run(run_id)
+                    layer: Literal["all", "completeness", "content", "structure", "format", "layout", "business", "uncertainty"] = "all",
+                    category: Literal["all", "completeness", "content", "structure", "format", "layout", "business"] = "all"):
+        with store.connect() as db:
+            exists = db.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not exists:
+            raise HTTPException(404, "找不到此比较结果")
         clauses = ["run_id=?"]
         args = [run_id]
         if kind != "all":
@@ -755,7 +702,10 @@ def create_app(data_dir: Path | None = None):
         if report_id:
             clauses.append("json_extract(payload, '$.report_id')=?")
             args.append(report_id)
-        if layer != "all":
+        if layer == "uncertainty" and category == "business":
+            clauses.append("(json_extract(payload, '$.layer')='uncertainty' OR "
+                           "(json_extract(payload, '$.layer')='business' AND json_extract(payload, '$.severity')='issue'))")
+        elif layer != "all":
             clauses.append("json_extract(payload, '$.layer')=?")
             args.append(layer)
         if category != "all":
@@ -771,7 +721,7 @@ def create_app(data_dir: Path | None = None):
     @app.get("/api/jobs/{job_id}/sheet-region")
     def region(job_id: str, side: Literal["old", "new"], sheet: str,
                start_row: int = Query(1, ge=1), start_column: int = Query(1, ge=1),
-               rows: int = Query(25, ge=1, le=100), columns: int = Query(10, ge=1, le=50)):
+               rows: int = Query(25, ge=1, le=100), columns: int = Query(10, ge=1, le=30)):
         return sheet_region(store.workbook(job_id, side), sheet, start_row, start_column, rows, columns)
 
     @app.get("/api/jobs/{job_id}/files/{side}")
@@ -790,10 +740,10 @@ def create_app(data_dir: Path | None = None):
         if job.get("kind") != "pdf" or page < 1 or page > len(pages):
             raise HTTPException(404, "找不到此 PDF 页面")
         path = store.folder / job_id / f"{side}-pages" / f"page-{page}.png"
-        if not path.is_file():
-            raise HTTPException(404, "页面图像不可用，请重新导入文件")
         if dpi == 288:
             path = path.with_name(f"page-{page}-288dpi.png")
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
             with _RENDER_LOCK:
                 if not path.is_file():
                     with pdfplumber.open(store.folder / job_id / f"{side}.pdf") as document:
@@ -804,6 +754,8 @@ def create_app(data_dir: Path | None = None):
                         temporary = path.with_suffix(".tmp")
                         image.save(temporary, format="PNG")
                         temporary.replace(path)
+                        image.close()
+                        original_page.close()
         return FileResponse(path, media_type="image/png")
 
     @app.get("/api/examples/pdf/{mode}/{side}")
@@ -826,8 +778,7 @@ def create_app(data_dir: Path | None = None):
             raise HTTPException(404, "示例文件尚未生成")
         return FileResponse(path, filename=f"example-{side}.xlsx")
 
-    dist = ROOT / "frontend" / "dist"
-    if dist.is_dir():
+    if has_dist:
         app.mount("/", StaticFiles(directory=dist, html=True), name="frontend")
     else:
         @app.get("/")

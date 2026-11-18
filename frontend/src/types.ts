@@ -8,6 +8,7 @@ export interface Source {
   page?: number;
   bbox?: [number, number, number, number];
   highlight_boxes?: [number, number, number, number][];
+  content_sources?: Source[];
   location_granularity?: 'text' | 'cell' | 'paragraph' | 'line' | 'frame' | 'table' | 'page' | 'region' | 'reference' | 'unconfirmed';
   location_reason?: string;
   method?: 'text' | 'ocr';
@@ -24,6 +25,7 @@ export interface PdfPage {
   rotation?: number;
   media_box?: number[];
   crop_box?: number[];
+  has_native_text?: boolean;
   native_lines?: unknown[];
   ocr_regions?: unknown[];
   number: number;
@@ -128,8 +130,8 @@ export interface Job {
 
 export interface Diff {
   report_id?: string;
-  layer?: 'completeness' | 'content' | 'structure' | 'format' | 'layout' | 'uncertainty';
-  category?: 'content' | 'structure' | 'format' | 'layout' | 'completeness';
+  layer?: 'completeness' | 'content' | 'structure' | 'format' | 'layout' | 'uncertainty' | 'business';
+  category?: ComparisonCategory | 'completeness';
   id: string;
   kind: string;
   table_id: string;
@@ -317,8 +319,20 @@ export interface BusinessReport {
   source: Source;
   issues?: string[];
 }
+export interface BusinessComparison {
+  report_id: string;
+  type_code: string;
+  status: 'unchanged' | 'changed' | 'pending';
+  compared_rows: number;
+  compared_fields: number;
+  issues: string[];
+  changes?: number;
+  issue_count?: number;
+}
 export interface ReportComparison {
+  business?: BusinessComparison;
   paragraph_checks?: ParagraphCheck[];
+  paragraph_check_summary?: ParagraphCheckSummary;
   comparison_status?: 'changed' | 'pending' | 'unchanged';
   dimensions?: Record<ComparisonDimension, DimensionSummary>;
   page_pairs?: ReportPagePair[];
@@ -377,6 +391,7 @@ export interface NonReportRegion {
 }
 
 export type ComparisonDimension = 'content' | 'structure' | 'format' | 'layout';
+export type ComparisonCategory = ComparisonDimension | 'business';
 export interface DimensionSummary {
   status: 'changed' | 'unchanged' | 'partial' | 'unverified' | 'not_applicable';
   changes: number;
@@ -399,5 +414,18 @@ export interface ParagraphCheck {
   new_source: Source | null;
   old_value?: string | null;
   new_value?: string | null;
-  measurements: Record<string, unknown>;
+  measurements?: Record<string, unknown>;
+}
+
+export interface ParagraphCheckSummary {
+  total: number;
+  changed: number;
+  unchanged: number;
+  unverified: number;
+}
+export interface ParagraphCheckPage {
+  items: ParagraphCheck[];
+  total: number;
+  offset: number;
+  limit: number;
 }

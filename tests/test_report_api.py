@@ -98,6 +98,28 @@ def test_report_snapshot_filter_and_export(tmp_path, monkeypatch):
         assert client.get(f"/api/runs/{run['id']}").json()['reports'][0]['basis'] == '对侧区域提取失败'
 
 
+def test_uncertainty_filter_includes_business_issues_without_business_changes(tmp_path):
+    events = [
+        {'kind': 'business_issue', 'category': 'business', 'layer': 'business', 'severity': 'issue'},
+        {'kind': 'business_value_changed', 'category': 'business', 'layer': 'business', 'severity': 'change'},
+        {'kind': 'attribute_unverified', 'category': 'format', 'layer': 'uncertainty', 'severity': 'issue'},
+        {'kind': 'font_changed', 'category': 'format', 'layer': 'format', 'severity': 'change'},
+    ]
+    with TestClient(create_app(tmp_path)) as client:
+        with client.app.state.store.connect() as db:
+            db.execute('INSERT INTO runs VALUES (?,?,?)', ('fixture', 'fixture-job', '{}'))
+            db.executemany('INSERT INTO diffs VALUES (?,?,?,?,?)', [
+                ('fixture', index, event['kind'], '', encode(event)) for index, event in enumerate(events)
+            ])
+        url = '/api/runs/fixture/diffs'
+        business = client.get(url, params={'category': 'business'}).json()
+        assert business['total'] == 2 and business['items'] == events[:2]
+        pending_format = client.get(url, params={'category': 'format', 'layer': 'uncertainty'}).json()
+        assert pending_format['total'] == 1 and pending_format['items'] == [events[2]]
+        pending_business = client.get(url, params={'category': 'business', 'layer': 'uncertainty'}).json()
+        assert pending_business['total'] == 1 and pending_business['items'] == [events[0]]
+
+
 def test_business_inventory_rebuild_preserves_review_ids_and_native_identity():
     from backend.reports import attach_report_inventory, suggest_report_pairs
     from backend.review import apply_reviews, review_catalog
@@ -236,7 +258,29 @@ def test_full_report_categories_page_pairs_and_export_are_same_snapshot(tmp_path
         run = response.json()
         assert run['reports'][0]['dimensions'] == report['dimensions']
         assert run['reports'][0]['page_pairs'] == report['page_pairs']
-        assert run['reports'][0]['paragraph_checks'] == report['paragraph_checks']
+        expected_checks = [{key: value for key, value in check.items() if key != 'measurements'}
+                           for check in report['paragraph_checks']]
+        assert 'paragraph_checks' not in run['reports'][0]
+        expected_summary = {'total': 1, 'changed': 1, 'unchanged': 0, 'unverified': 0}
+        assert run['reports'][0]['paragraph_check_summary'] == expected_summary
+        checks_query = f"/api/runs/{run['id']}/paragraph-checks"
+        checks_page = client.get(checks_query, params={'report_id': 'full-r1', 'limit': 1}).json()
+        assert checks_page == {'items': expected_checks, 'total': 1, 'offset': 0, 'limit': 1}
+        assert client.get(checks_query, params={'report_id': 'full-r1', 'offset': 1}).json()['items'] == []
+        assert client.get(checks_query, params={'report_id': 'missing'}).status_code == 404
+        assert client.get(checks_query, params={'report_id': 'full-r1', 'limit': 101}).status_code == 422
+        assert client.app.state.store.run(run['id'])['reports'][0]['paragraph_checks'] == report['paragraph_checks']
+        history = client.get(f"/api/jobs/{job['id']}/runs").json()['items']
+        assert history == [{
+            'id': run['id'],
+            'job_id': job['id'],
+            'status': run['status'],
+            'review_revision': run['review_revision'],
+            'report_inventory_version': 2,
+            'created_at': run['created_at'],
+            'summary': run['summary'],
+        }]
+        assert 'reports' not in history[0]
         assert 'appearance' not in run['review_pages']['old'][0]
         query = f"/api/runs/{run['id']}/diffs"
         filtered = client.get(query, params={'category': 'format', 'report_id': 'full-r1', 'limit': 1, 'offset': 1}).json()
@@ -262,4 +306,126 @@ def test_full_report_categories_page_pairs_and_export_are_same_snapshot(tmp_path
         fixed = client.get(f"/api/runs/{run['id']}").json()
         assert fixed['reports'][0]['page_pairs'][0]['new_page'] == 2
         assert fixed['reports'][0]['dimensions']['layout']['summary'] == 'layout fixture'
-        assert fixed['reports'][0]['paragraph_checks'][0]['measurements']['new']['baseline_gaps_pt'] == [24, 24]
+        assert 'paragraph_checks' not in fixed['reports'][0]
+        assert fixed['reports'][0]['paragraph_check_summary'] == expected_summary
+        assert client.get(checks_query, params={'report_id': 'full-r1'}).json()['items'] == expected_checks
+        assert client.app.state.store.run(run['id'])['reports'][0]['paragraph_checks'][0]['measurements']['new']['baseline_gaps_pt'] == [24, 24]
+        monkeypatch.setattr(client.app.state.store, 'run', lambda *_: (_ for _ in ()).throw(AssertionError('diff pagination must not load run evidence')))
+        assert client.get(query).status_code == 200
+        assert client.get(checks_query, params={'report_id': 'full-r1'}).json()['items'] == expected_checks
+        assert client.get('/api/runs/missing/paragraph-checks', params={'report_id': 'full-r1'}).status_code == 404
+        assert client.get('/api/runs/missing/diffs').status_code == 404
+
+
+def test_public_run_retains_check_status_and_source_without_measurement_payload():
+    from backend.app import public_run, public_paragraph_check
+
+    source = {'kind': 'pdf', 'page': 4, 'bbox': [.1, .2, .3, .4], 'location_precision': 'paragraph',
+              'highlight_boxes': [[.1, .2, .3, .4]], 'content_sources': [{'text': 'internal words'}]}
+    check = {'attribute': 'alignment', 'status': 'unchanged', 'message': '相同', 'old_value': 'left',
+             'new_value': 'left', 'old_source': source, 'new_source': None,
+             'measurements': {'lines': ['large internal evidence']}}
+    original = {'id': 'run', 'reports': [{'id': 'report', 'paragraph_checks': [check]}]}
+    result = public_run(original)
+    assert 'paragraph_checks' not in result['reports'][0]
+    assert result['reports'][0]['paragraph_check_summary'] == {'total': 1, 'changed': 0, 'unchanged': 1, 'unverified': 0}
+    projected = public_paragraph_check(check)
+    assert projected['status'] == 'unchanged' and projected['old_value'] == 'left'
+    assert projected['old_source'] == {key: value for key, value in source.items() if key != 'content_sources'}
+    assert 'measurements' not in projected
+    assert original['reports'][0]['paragraph_checks'][0]['measurements']['lines']
+    assert original['reports'][0]['paragraph_checks'][0]['old_source']['content_sources']
+
+
+def test_paragraph_checks_are_paged_without_truncating_stored_evidence(tmp_path, monkeypatch):
+    checks = [{'attribute': 'alignment', 'status': 'unchanged', 'message': f'check {index}',
+               'old_source': {'kind': 'pdf', 'page': index + 1, 'bbox': [0, 0, 1, 1]}, 'new_source': None,
+               'measurements': {'internal': 'evidence' * 200}}
+              for index in range(205)]
+    run = {'id': 'paged-run', 'job_id': 'job', 'reports': [
+        {'id': 'report', 'paragraph_checks': checks}, {'id': 'legacy-report'}]}
+    with TestClient(create_app(tmp_path)) as client:
+        store = client.app.state.store
+        with store.connect() as db:
+            db.execute('INSERT INTO runs VALUES (?,?,?)', (run['id'], 'job', encode(run)))
+        monkeypatch.setattr(store, 'run', lambda *_: (_ for _ in ()).throw(AssertionError('paging must stay in SQL')))
+        path = '/api/runs/paged-run/paragraph-checks'
+        collected = []
+        for offset in (0, 100, 200):
+            response = client.get(path, params={'report_id': 'report', 'offset': offset})
+            assert response.status_code == 200, response.text
+            page = response.json()
+            assert page['total'] == 205 and page['offset'] == offset and page['limit'] == 100
+            assert all('measurements' not in check for check in page['items'])
+            collected.extend(page['items'])
+        assert [check['message'] for check in collected] == [f'check {index}' for index in range(205)]
+        assert [check['old_source']['page'] for check in collected] == list(range(1, 206))
+        assert client.get(path, params={'report_id': 'legacy-report'}).json()['total'] == 0
+        with store.connect() as db:
+            stored = json.loads(db.execute('SELECT metadata FROM runs WHERE id=?', (run['id'],)).fetchone()[0])
+        assert stored['reports'][0]['paragraph_checks'] == checks
+
+
+def test_job_runs_list_returns_lightweight_fields_for_excel_v0_v1_v2(tmp_path, monkeypatch):
+    with TestClient(create_app(tmp_path)) as client:
+        store = client.app.state.store
+        job = {'id': 'mixed-job', 'kind': 'pdf', 'files': {}}
+        v0_run = {
+            'id': 'run-v0', 'job_id': 'mixed-job', 'status': 'completed',
+            'summary': {'changes': 1, 'issues': 0}, 'coverage': {'warnings': []},
+            'config': {'pairs': []}, 'created_at': '2026-11-01T00:00:00Z',
+        }
+        v1_run = {
+            'id': 'run-v1', 'job_id': 'mixed-job', 'status': 'completed_with_issues',
+            'review_revision': 1, 'report_inventory_version': 1,
+            'summary': {'changes': 2, 'issues': 1}, 'coverage': {'warnings': []},
+            'config': {'pairs': []}, 'reports': [{'id': 'r1'}],
+            'review_pages': {'old': [], 'new': []}, 'created_at': '2026-11-02T00:00:00Z',
+        }
+        v2_run = {
+            'id': 'run-v2', 'job_id': 'mixed-job', 'status': 'completed',
+            'review_revision': 2, 'report_inventory_version': 2,
+            'summary': {'changes': 3, 'issues': 0}, 'coverage': {'warnings': []},
+            'config': {'pairs': []},
+            'reports': [{'id': 'r2', 'paragraph_checks': [{'measurements': 'heavy' * 100}]}],
+            'review_pages': {'old': [], 'new': []}, 'created_at': '2026-11-03T00:00:00Z',
+        }
+        with store.connect() as db:
+            db.execute('INSERT INTO jobs VALUES (?,?)', ('mixed-job', encode(job)))
+            for item in (v0_run, v1_run, v2_run):
+                db.execute('INSERT INTO runs VALUES (?,?,?)', (item['id'], 'mixed-job', encode(item)))
+        # 禁止整条 metadata 读取路径，确认列表接口仅走 SQLite json_extract
+        monkeypatch.setattr(store, 'run', lambda *_: (_ for _ in ()).throw(AssertionError('runs list must stay in SQL')))
+        response = client.get('/api/jobs/mixed-job/runs')
+        assert response.status_code == 200, response.text
+        items = response.json()['items']
+        assert [item['id'] for item in items] == ['run-v2', 'run-v1', 'run-v0']
+        assert set(items[2]) == {'id', 'job_id', 'status', 'summary', 'created_at'}
+        assert items[2]['summary'] == {'changes': 1, 'issues': 0}
+        assert set(items[1]) == {
+            'id', 'job_id', 'status', 'review_revision', 'report_inventory_version', 'created_at', 'summary',
+        }
+        assert items[1]['review_revision'] == 1 and items[1]['report_inventory_version'] == 1
+        assert set(items[0]) == {
+            'id', 'job_id', 'status', 'review_revision', 'report_inventory_version', 'created_at', 'summary',
+        }
+        assert items[0]['review_revision'] == 2 and items[0]['report_inventory_version'] == 2
+        for item in items:
+            for heavy_key in ('reports', 'paragraph_checks', 'coverage', 'config', 'review_pages'):
+                assert heavy_key not in item
+        assert client.get('/api/jobs/missing-job/runs').status_code == 404
+
+
+def test_job_runs_list_tolerates_scalar_string_summary(tmp_path):
+    with TestClient(create_app(tmp_path)) as client:
+        store = client.app.state.store
+        job = {'id': 'scalar-job', 'kind': 'pdf', 'files': {}}
+        legacy_run = {'id': 'run-scalar', 'job_id': 'scalar-job', 'status': 'completed', 'summary': 'ok'}
+        with store.connect() as db:
+            db.execute('INSERT INTO jobs VALUES (?,?)', ('scalar-job', encode(job)))
+            db.execute('INSERT INTO runs VALUES (?,?,?)', ('run-scalar', 'scalar-job', encode(legacy_run)))
+        response = client.get('/api/jobs/scalar-job/runs')
+        assert response.status_code == 200, response.text
+        assert response.json()['items'] == [
+            {'id': 'run-scalar', 'job_id': 'scalar-job', 'status': 'completed', 'summary': 'ok'}
+        ]

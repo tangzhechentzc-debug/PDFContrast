@@ -158,8 +158,8 @@ def prepare_structure_event(current_book: dict, event: dict) -> dict:
 def _set_text(sheet: dict, cell: dict, text: str) -> None:
     cell.update(value=text or None, display=text, current_text=text, value_type="string" if text else "blank")
     header = sheet["cells"].get(f"{get_column_letter(cell['column'])}1", {})
-    label = (header.get("current_text", header.get("display", "")) if sheet.get("structure_revision") else
-             header.get("raw_text", header.get("display", "")))
+    # 始终优先读取第 1 行表头的当前修订文本，依次回退原始文本与展示文本
+    label = header.get("current_text", header.get("raw_text", header.get("display", "")))
     identifier = any(part in label.lower() for part in ("编号", "编码", "代码", "序号", "id", "code"))
     if sheet.get("structure_revision"):
         numeric_header = any(part in label.lower() for part in ("金额", "数量", "单价", "合价", "税率", "比例", "数值",
@@ -196,7 +196,7 @@ def _review_state(book: dict, originally_unconfirmed: set[int]) -> tuple[dict, d
     return targets, by_page
 
 
-def apply_reviews(book: dict, events: list[dict]) -> dict:
+def apply_reviews(book: dict, events: list[dict], rebuild_inventory: bool = True) -> dict:
     result = copy.deepcopy(book)
     sheets = {sheet["name"]: sheet for sheet in result["sheets"]}
     pages = {page["number"]: page for page in result.get("pages", [])}
@@ -268,10 +268,11 @@ def apply_reviews(book: dict, events: list[dict]) -> dict:
                     raise ValueError("校正内容必须为文本；清空单元格请使用空字符串。")
                 _set_text(sheet, cell, event["value"])
                 cell.update(reviewed=False, correction_revision=event["revision"])
-                if sheet.get("structure_revision") and cell["row"] == 1:
+                # 无论是否经历结构重建，第 1 行表头变更后都需基于数据格原文本重算同列类型
+                if cell["row"] == 1:
                     for dependent in sheet["cells"].values():
                         if dependent["row"] > 1 and dependent["column"] == cell["column"]:
-                            _set_text(sheet, dependent, dependent.get("current_text", dependent["display"]))
+                            _set_text(sheet, dependent, dependent.get("current_text", dependent.get("raw_text", dependent.get("display", ""))))
             else:
                 cell["reviewed"] = action == "cell_verify"
             if action != "cell_verify":
@@ -342,7 +343,7 @@ def apply_reviews(book: dict, events: list[dict]) -> dict:
                     ("内容已完成整页人工核验。" if pages[number]["reviewed"] else "结构确认不等于内容核验，请继续核对文字与漏项。"))
         if any(warning.startswith(f"第 {number} 页同时包含文本和图像，") for number in reviewed_pages):
             result["warnings"][index] = warning.replace("包括原有文本在内均需核验", "包括原有文本在内已完成整页人工核验")
-    if result.get("report_inventory_version"):
+    if rebuild_inventory and result.get("report_inventory_version"):
         from .reports import attach_report_inventory
         result = attach_report_inventory(result)
     return result

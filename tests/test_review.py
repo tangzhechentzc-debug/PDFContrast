@@ -167,3 +167,63 @@ def test_text_block_synthetic_header_is_not_editable_and_raw_spacing_is_preserve
     changed = apply_reviews(book, [event("cell_update", target_id=rows[0]["id"], value="Corrected body")])
     diff = next(d for d in compare(book, changed)["diffs"] if d["kind"] == "ocr_suspected")
     assert diff["new_value"] == "Corrected body"
+
+
+def test_header_cell_update_without_structure_rebuild_preserves_leading_zeros_and_recomputes_column():
+    # 未经历结构重建的 OCR 表，将第 1 行表头改为“项目编码”时须保留同列前导零并重算既有数据行类型
+    book = workbook()
+    # 路径 A：先改第 1 行 B1 为“项目编码”，再录入同列数据 "00124"
+    edited = apply_reviews(book, [
+        event("cell_update", 1, target_id=target(book, 1, "B1"), value="项目编码"),
+        event("cell_update", 2, target_id=target(book, 1, "B2"), value="00124"),
+    ])
+    sheet = edited["sheets"][0]
+    assert not sheet.get("structure_revision")
+    assert sheet["cells"]["B1"]["current_text"] == "项目编码"
+    assert sheet["cells"]["B2"]["value"] == "00124"
+    assert sheet["cells"]["B2"]["display"] == "00124"
+    assert sheet["cells"]["B2"]["current_text"] == "00124"
+    assert sheet["cells"]["B2"]["value_type"] == "string"
+    logical = next(s for s in edited["sheets"] if s.get("member_sheets"))
+    assert logical["cells"]["B2"]["value"] == "00124"
+    assert logical["cells"]["B2"]["value_type"] == "string"
+
+    # 路径 B：先按旧表头 "Amount" 录入 "00124"（被算作数字 "124"），再改第 1 行表头应自动重算恢复前导零
+    before_header_fix = apply_reviews(book, [
+        event("cell_update", 1, target_id=target(book, 2, "B2"), value="00124"),
+    ])
+    assert before_header_fix["sheets"][1]["cells"]["B2"]["value"] == "124"
+    assert before_header_fix["sheets"][1]["cells"]["B2"]["value_type"] == "number"
+
+    after_header_fix = apply_reviews(book, [
+        event("cell_update", 1, target_id=target(book, 2, "B2"), value="00124"),
+        event("cell_update", 2, target_id=target(book, 2, "B1"), value="项目编码"),
+    ])
+    recomputed = after_header_fix["sheets"][1]["cells"]["B2"]
+    assert recomputed["value"] == "00124"
+    assert recomputed["current_text"] == "00124"
+    assert recomputed["value_type"] == "string"
+
+
+def test_apply_reviews_can_skip_inventory_rebuild_when_requested(monkeypatch):
+    import backend.reports as reports_module
+
+    calls = []
+    original_attach = reports_module.attach_report_inventory
+
+    def tracked_attach(target_book):
+        calls.append(target_book.get("report_inventory_version"))
+        return original_attach(target_book)
+
+    monkeypatch.setattr(reports_module, "attach_report_inventory", tracked_attach)
+    book = workbook()
+    book["report_inventory_version"] = 2
+
+    rebuilt = apply_reviews(book, [])
+    assert calls == [2]
+    assert "reports" in rebuilt
+
+    calls.clear()
+    skipped = apply_reviews(book, [], rebuild_inventory=False)
+    assert calls == []
+    assert review_catalog(skipped) == review_catalog(rebuilt)

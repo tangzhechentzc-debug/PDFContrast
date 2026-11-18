@@ -63,7 +63,7 @@ export default function PdfViewer({ job, side, source, selectionId, isIssue, pag
     showPage(number);
   }
 
-  const mixed = page?.method === 'ocr' && (page.native_lines?.length ?? 0) > 0;
+  const mixed = page?.method === 'ocr' && (page.has_native_text ?? (page.native_lines?.length ?? 0) > 0);
   const scanned = page?.method === 'ocr' || (source?.page === pageNumber && source.method === 'ocr');
   return <section className="viewer pdf-viewer" aria-label={`${sideLabel} PDF 原文`}>
     <div className="viewer-heading"><span className="label">{sideLabel}</span><a href={`/api/jobs/${job.id}/files/${side}`} download className="small">下载原件</a></div>

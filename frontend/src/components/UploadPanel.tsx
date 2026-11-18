@@ -20,26 +20,38 @@ export default function UploadPanel({ onUploaded, importId, onImportStarted, onI
   const [retry, setRetry] = useState(0);
   const [checking, setChecking] = useState(false);
   const uploadController = useRef<AbortController | null>(null);
+  const retryButton = useRef<HTMLButtonElement>(null);
+  const progressHeading = useRef<HTMLHeadingElement>(null);
+  const focusProgress = useRef(false);
   const uploadedCallback = useRef(onUploaded);
   uploadedCallback.current = onUploaded;
   const busy = uploading || !!importId;
 
   useEffect(() => () => uploadController.current?.abort(), []);
   useEffect(() => {
+    if (focusProgress.current) {
+      focusProgress.current = false;
+      progressHeading.current?.focus();
+    }
+  }, [importStatus]);
+  useEffect(() => {
     if (!importId) { setImportStatus(null); setPollError(''); return; }
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    setPollError(''); setChecking(true);
+    setChecking(true);
     async function poll() {
       try {
         const status = await request<ImportStatus>(`/api/imports/${encodeURIComponent(importId!)}`, { signal: controller.signal });
         if (controller.signal.aborted) return;
-        setImportStatus(status);
         if (status.status === 'ready') {
+          setImportStatus(status);
           const job = await request<Job>(`/api/jobs/${encodeURIComponent(status.job_id ?? status.id)}`, { signal: controller.signal });
           if (!controller.signal.aborted) uploadedCallback.current(job);
           return;
         }
+        focusProgress.current = !!retryButton.current && document.activeElement === retryButton.current;
+        setImportStatus(status);
+        setPollError('');
         setChecking(false);
         if (status.status !== 'failed') timer = setTimeout(() => void poll(), 750);
       } catch (e) {
@@ -87,16 +99,29 @@ export default function UploadPanel({ onUploaded, importId, onImportStarted, onI
     const progress = importStatus?.progress;
     const unit = progress?.unit === 'page' ? '页' : progress?.unit === 'sheet' ? '个工作表' : null;
     const activeFile = progress?.side ? importStatus?.files[progress.side] : null;
+    const heading = importStatus?.status === 'failed' ? '报表导入未完成'
+      : pollError ? importStatus?.status === 'ready' ? '导入完成，暂时无法读取配置' : '暂时无法读取导入进度'
+      : importStatus?.status === 'ready' ? '导入完成，正在打开配置' : '正在导入报表';
     return <section className="import-section" aria-labelledby="import-heading">
-      <div className="section-heading"><div><h2 id="import-heading">{importStatus?.status === 'failed' ? '报表导入未完成' : importStatus?.status === 'ready' ? '导入完成，正在打开配置' : '正在导入报表'}</h2><p className="muted">任务已保留，刷新页面可恢复进度。</p></div><span className="chip">本机后台处理</span></div>
-      {importStatus && <div className="file-summary">{(['old', 'new'] as const).map(side => <div key={side}><span className="label">{side === 'old' ? '旧版' : '新版'}{progress?.side === side && importStatus.status === 'processing' ? ' · 当前处理' : ''}</span><strong>{importStatus.files[side].name}</strong></div>)}</div>}
-      {progress ? <div className="import-progress" aria-live="polite"><div className="section-heading"><div><h3>{stageLabels[progress.stage] ?? progress.stage}</h3>{activeFile && <p>{progress.side === 'old' ? '旧版' : '新版'} · {activeFile.name}</p>}</div><span className="chip">{progress.file_index > 0 ? `第 ${progress.file_index} / ${progress.file_count} 份文件` : `共 ${progress.file_count} 份文件`}</span></div>
-        {unit && <><p className="import-counts">{progress.current > 0 ? progress.unit === 'page' ? `当前第 ${progress.current} 页` : `当前第 ${progress.current} 个工作表` : '尚未开始处理页面 / 工作表'}{progress.total != null ? ` · 共 ${progress.total} ${unit}` : ' · 总数尚未确定'}</p>{progress.unit === 'sheet' && progress.item_name && <p className="muted">工作表：{progress.item_name}</p>}<p>已处理 {progress.completed}{progress.total != null ? ` / ${progress.total}` : ''} {unit}</p>{progress.total != null && progress.total > 0 && <progress aria-label={progress.unit === 'page' ? '当前文件已处理页数' : '当前文件已处理工作表数'} value={progress.completed} max={progress.total} />}<p className="muted small">进度仅针对当前文件，按已处理数量显示，不代表剩余时间。已处理页可能包含识别问题，完成后请查看提取提示并核验。</p></>}
-        {!unit && <p className="muted">{importStatus.status === 'queued' ? '任务正在队列中等待处理。' : '正在准备或整理导入结果。'}</p>}
-      </div> : <p className="status-line" role="status">正在恢复导入任务…</p>}
-      {pollError && <div className="error-banner" role="alert"><p>读取导入任务失败：{pollError}</p><p>任务标识已保留；重试只查询此任务，不会重复上传文件。</p><button disabled={checking} onClick={() => setRetry(n => n + 1)}>重试读取进度</button></div>}
+      <div className="section-heading"><div><h2 id="import-heading">{heading}</h2><p className="muted">任务已保留，刷新页面可恢复进度。</p></div><span className="chip">本机后台处理</span></div>
+      {pollError && <div className="error-banner">
+        {checking ? <p role="status">正在重新查询导入任务…</p> : <p role="alert">读取导入状态失败：{pollError}</p>}
+        <p>任务标识已保留；重试只查询此任务，不会重复上传文件。</p>
+        <button ref={retryButton} type="button" aria-disabled={checking} onClick={() => {
+          if (checking) return;
+          setChecking(true);
+          setRetry(n => n + 1);
+        }}>重试读取进度</button>
+      </div>}
+      {importStatus && <div className="file-summary">{(['old', 'new'] as const).map(side => <div key={side}><span className="label">{side === 'old' ? '旧版' : '新版'}{!pollError && progress?.side === side && importStatus.status === 'processing' ? ' · 当前处理' : ''}</span><strong>{importStatus.files[side].name}</strong></div>)}</div>}
+      {progress ? <div className="import-progress" aria-live="polite">
+        {pollError && importStatus.status !== 'ready' && <p className="muted small">上次已知进度</p>}
+        <div className="section-heading"><div><h3 ref={progressHeading} tabIndex={-1}>{stageLabels[progress.stage] ?? progress.stage}</h3>{activeFile && <p>{progress.side === 'old' ? '旧版' : '新版'} · {activeFile.name}</p>}</div><span className="chip">{progress.file_index > 0 ? `第 ${progress.file_index} / ${progress.file_count} 份文件` : `共 ${progress.file_count} 份文件`}</span></div>
+        {unit && <><p className="import-counts">{progress.current > 0 ? `${pollError ? '上次记录' : '当前'}第 ${progress.current} ${progress.unit === 'page' ? '页' : '个工作表'}` : '尚未开始处理页面 / 工作表'}{progress.total != null ? ` · 共 ${progress.total} ${unit}` : ' · 总数尚未确定'}</p>{progress.unit === 'sheet' && progress.item_name && <p className="muted">工作表：{progress.item_name}</p>}<p>已处理 {progress.completed}{progress.total != null ? ` / ${progress.total}` : ''} {unit}</p>{progress.total != null && progress.total > 0 && <progress aria-label={progress.unit === 'page' ? '当前文件已处理页数' : '当前文件已处理工作表数'} value={progress.completed} max={progress.total} />}<p className="muted small">进度仅针对当前文件，按已处理数量显示，不代表剩余时间。已处理页可能包含识别问题，完成后请查看提取提示并核验。</p></>}
+        {!unit && !pollError && <p className="muted">{importStatus.status === 'queued' ? '任务正在队列中等待处理。' : '正在准备或整理导入结果。'}</p>}
+      </div> : !pollError && <p className="status-line" role="status">正在恢复导入任务…</p>}
       {importStatus?.status === 'failed' && <div className="error-banner" role="alert"><p>{importStatus.error || '后台导入失败，请返回检查文件后重试。'}</p><button onClick={onImportCleared}>返回选文件并重试</button></div>}
-      {checking && importStatus && <p className="status-line" role="status">{importStatus.status === 'ready' ? '读取完整报表，准备比较配置…' : '正在读取最新进度…'}</p>}
+      {checking && importStatus && !pollError && <p className="status-line" role="status">{importStatus.status === 'ready' ? '读取完整报表，准备比较配置…' : '正在读取最新进度…'}</p>}
       <p className="muted small import-task-id">导入任务：{importId}</p>
     </section>;
   }

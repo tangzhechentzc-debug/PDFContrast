@@ -191,3 +191,33 @@ def test_font_change_names_the_actual_property(tmp_path):
     result = compare_workbooks(old, new, configuration(old, new, compare_formatting=True))
     assert result["summary"]["by_kind"] == {"format_changed": 1}
     assert "变化属性：字体。" in result["diffs"][0]["message"]
+
+
+def test_filling_blank_cell_with_default_style_does_not_report_format_change(tmp_path):
+    # 开启格式比较时，默认样式单元格从空白填值或反向清空均不应误报 format_changed
+    old, new = extract_pair(tmp_path, [["001", 10, None]], [["001", 10, "新增说明"]],
+                            headers=["项目编码", "金额", "备注"])
+    result = compare_workbooks(old, new, configuration(old, new, compare_formatting=True))
+    assert result["summary"]["by_kind"] == {"value_changed": 1}
+    assert [d["kind"] for d in result["diffs"]] == ["value_changed"]
+
+    cleared = compare_workbooks(new, old, configuration(new, old, compare_formatting=True))
+    assert cleared["summary"]["by_kind"] == {"value_changed": 1}
+
+    # 真实样式修改（如字体加粗）仍须准确报出 format_changed，且仅列出发生变化的属性类别
+    from openpyxl.styles import Font
+
+    styled_wb = Workbook()
+    ws = styled_wb.active
+    ws.title = "费用明细"
+    ws.append(["项目编码", "金额", "备注"])
+    ws.append(["001", 10, "新增说明"])
+    ws["C2"].font = Font(bold=True)
+    styled_path = tmp_path / "styled.xlsx"
+    styled_wb.save(styled_path)
+    styled_new = extract_workbook(styled_path)
+
+    real_change = compare_workbooks(old, styled_new, configuration(old, styled_new, compare_formatting=True))
+    assert real_change["summary"]["by_kind"] == {"value_changed": 1, "format_changed": 1}
+    fmt_diff = next(d for d in real_change["diffs"] if d["kind"] == "format_changed")
+    assert "变化属性：字体。" in fmt_diff["message"]

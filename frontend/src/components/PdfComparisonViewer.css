@@ -1,4 +1,11 @@
 .full-page-viewer { min-width: 0; padding: .75rem 1rem; }
+.original-scope { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .7rem; margin-bottom: .55rem; color: var(--text-dim); font-size: .8rem; overflow-wrap: anywhere; }
+.original-scope p { margin: 0; min-width: 0; }
+.original-scope .original-scope-identity { color: var(--text); font-weight: 650; }
+.original-scope-project { min-width: 0; max-width: 100%; }
+.original-scope-project[open] { flex: 1 0 100%; }
+.original-scope-project summary { cursor: pointer; color: var(--info); }
+.original-scope-project p { margin-top: .2rem; }
 .original-toolbar, .page-view-options { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .65rem; }
 .original-toolbar { justify-content: space-between; }
 .evidence-views { display: flex; gap: .25rem; flex-wrap: wrap; align-items: center; }
@@ -26,7 +33,8 @@
 .physical-paper.new { outline: 1px solid var(--accent); }
 .physical-paper img { display: block; width: 100%; height: 100%; object-fit: contain; }
 .paper-loading { position: absolute; top: .65rem; left: .65rem; line-height: 1.5; font-size: .8rem; color: #333; }
-.paper-image-error { position: sticky; top: 0; left: 0; width: min(14rem, 100%); padding: .6rem; line-height: 1.5; color: #72291d; background: #fff; font-size: .8rem; }
+.paper-image-error { position: sticky; z-index: 1; top: 0; left: 0; width: min(14rem, 100%); padding: .6rem; line-height: 1.5; color: #72291d; background: #fff; font-size: .8rem; }
+.overlay .physical-paper.new .paper-image-error { margin-inline-start: auto; }
 .paper-image-error button { display: block; margin-top: .35rem; color: var(--text); }
 .full-page-highlight { position: absolute; border: 2px solid var(--info); background: color-mix(in srgb, var(--info) 12%, transparent); pointer-events: none; }
 .physical-paper.new .full-page-highlight { border-color: var(--accent); }
@@ -36,6 +44,7 @@
 .manual-pages .full-page-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .original-downloads { display: flex; flex-wrap: wrap; gap: .4rem .75rem; margin-top: .5rem; }
 .pdf-detail-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem; }
+.detail-side-switch { margin-bottom: .4rem; }
 .pdf-detail-side { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); }
 .pdf-detail-side h4 { margin: 0; padding: .35rem .5rem; font-size: .8rem; border-bottom: 1px solid var(--border); }
 .pdf-detail-side.old h4 { color: var(--info); }

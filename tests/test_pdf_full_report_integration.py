@@ -9,7 +9,7 @@ from test_report_inventory import book
 def test_whole_report_keeps_literal_grid_values_and_decimal_delta(monkeypatch):
     calls = []
 
-    def appearance(old, new, entry):
+    def appearance(old, new, entry, *, overlays_by_side=None):
         calls.append(entry)
         return {'diffs': [], 'paragraph_checks': [{'attribute': 'line_spacing', 'status': 'unchanged', 'message': '相邻基线一致', 'measurements': {'unit': 'pt', 'old': [18], 'new': [18]}}], 'page_pairs': [{'old_page': 1, 'new_page': 1, 'basis': 'fixture', 'status': 'confirmed'}],
                 'dimensions': {category: {'status': 'unchanged', 'changes': 0, 'issues': 0,
@@ -61,7 +61,7 @@ def test_v2_text_review_does_not_require_inventing_a_table():
 
 
 def test_pdf_key_spacing_does_not_invent_row_add_remove_and_preserves_text_boxes(monkeypatch):
-    def appearance(old, new, entry):
+    def appearance(old, new, entry, *, overlays_by_side=None):
         return {'diffs': [], 'page_pairs': [{'old_page': 1, 'new_page': 1, 'basis': 'fixture', 'status': 'confirmed'}],
                 'dimensions': {category: {'status': 'unchanged', 'changes': 0, 'issues': 0, 'summary': 'fixture', 'limitations': []}
                                for category in ('content', 'structure', 'format', 'layout')}}
@@ -109,7 +109,7 @@ def test_global_extraction_blocker_is_not_a_paired_source_for_single_candidate(m
 def test_name_key_change_uses_unique_sequence_and_unchanged_other_fields(monkeypatch):
     from test_report_inventory import sheet
 
-    def appearance(old, new, entry):
+    def appearance(old, new, entry, *, overlays_by_side=None):
         return {'diffs': [], 'page_pairs': [{'old_page': 1, 'new_page': 1, 'basis': 'fixture', 'status': 'confirmed'}],
                 'dimensions': {category: {'status': 'unchanged', 'changes': 0, 'issues': 0, 'summary': 'fixture', 'limitations': []}
                                for category in ('content', 'structure', 'format', 'layout')}}
@@ -135,7 +135,7 @@ def test_name_key_change_uses_unique_sequence_and_unchanged_other_fields(monkeyp
 
 
 def test_grid_header_is_not_counted_again_after_native_cell_comparison(monkeypatch):
-    def appearance(old, new, entry):
+    def appearance(old, new, entry, *, overlays_by_side=None):
         diff = {'kind': 'text_changed', 'field': '文字内容', 'old_value': '金额（元）', 'new_value': '金额 (元)',
                 'category': 'content', 'layer': 'content', 'severity': 'change', 'message': 'native header',
                 'old_source': {'page': 1, 'bbox': [.3, .33, .5, .36]}, 'new_source': {'page': 1, 'bbox': [.3, .33, .5, .36]},
@@ -156,7 +156,7 @@ def test_grid_header_is_not_counted_again_after_native_cell_comparison(monkeypat
 
 
 def test_body_spacing_is_not_counted_again_after_native_cell_comparison(monkeypatch):
-    def appearance(old, new, entry):
+    def appearance(old, new, entry, *, overlays_by_side=None):
         diff = {'kind': 'text_whitespace_changed', 'field': '原文空白', 'old_value': '合    计', 'new_value': '合计',
                 'category': 'format', 'layer': 'format', 'severity': 'change', 'message': 'native spacing',
                 'old_source': {'page': 1, 'bbox': [.2, .4, .4, .42]}, 'new_source': {'page': 1, 'bbox': [.2, .4, .3, .42]},
@@ -184,7 +184,7 @@ def test_location_granularity_distinguishes_whole_frame_from_unconfirmed_text(mo
     glyph = {'page': 1, 'bbox': [.2, .3, .25, .32], 'location_precision': 'text'}
     originals = copy.deepcopy((frame, unavailable, glyph))
 
-    def appearance(old, new, entry):
+    def appearance(old, new, entry, *, overlays_by_side=None):
         events = [
             {'kind': 'form_geometry_changed', 'category': 'layout', 'old_source': frame, 'new_source': frame},
             {'kind': 'text_changed', 'category': 'content', 'old_source': unavailable, 'new_source': glyph},
@@ -209,3 +209,126 @@ def test_location_granularity_distinguishes_whole_frame_from_unconfirmed_text(mo
     assert text['new_source']['location_granularity'] == 'text'
     assert (frame, unavailable, glyph) == originals
     assert layout['old_source']['bbox'] == frame['bbox']
+
+
+def test_extract_pdf_reuses_single_table_extraction_and_keeps_original_index(tmp_path, monkeypatch):
+    import pdfplumber
+    from reportlab.pdfgen import canvas
+    from backend.pdf import extract_pdf
+
+    pdf_path = tmp_path / 'tables.pdf'
+    writer = canvas.Canvas(str(pdf_path), pagesize=(400, 600))
+    # 第 1 页：上方放置一个 1x2 小表（应被结构表过滤），下方放置一个 2x2 有效表
+    for x in (40, 140, 240):
+        writer.line(x, 500, x, 540)
+    for y in (500, 540):
+        writer.line(40, y, 240, y)
+    writer.drawString(50, 515, 'A')
+    writer.drawString(150, 515, 'B')
+
+    for x in (40, 140, 240):
+        writer.line(x, 300, x, 380)
+    for y in (300, 340, 380):
+        writer.line(40, y, 240, y)
+    for x, y, label in ((50, 355, 'Code'), (150, 355, 'Amount'), (50, 315, '01'), (150, 315, '120')):
+        writer.drawString(x, y, label)
+    writer.showPage()
+
+    # 第 2 页：不含任何表格（验证传入空表列表 [] 时也不会重复触发 find_tables）
+    writer.drawString(40, 500, 'Page two without tables')
+    writer.showPage()
+    writer.save()
+
+    find_calls = []
+    extract_calls = []
+    original_find_tables = pdfplumber.page.Page.find_tables
+    original_extract = pdfplumber.table.Table.extract
+
+    def counted_find_tables(self, *args, **kwargs):
+        find_calls.append(self.page_number)
+        return original_find_tables(self, *args, **kwargs)
+
+    def counted_extract(self, *args, **kwargs):
+        extract_calls.append(1)
+        return original_extract(self, *args, **kwargs)
+
+    monkeypatch.setattr(pdfplumber.page.Page, 'find_tables', counted_find_tables)
+    monkeypatch.setattr(pdfplumber.table.Table, 'extract', counted_extract)
+
+    extracted = extract_pdf(pdf_path, tmp_path / 'assets')
+    assert find_calls == [1, 2]
+    assert len(extract_calls) == 2
+    # 跳过第 1 个 1x2 表后，第 2 个表仍保留原始 1-based 序号
+    table_sheets = [s for s in extracted['sheets'] if s.get('structure') == 'table' and not s.get('member_sheets')]
+    assert [s['name'] for s in table_sheets] == ['第 1 页 · 表 2']
+    assert all('raw_tables' not in page for page in extracted['pages'])
+
+
+def test_extract_page_appearance_two_args_and_omits_gray_png_base64(tmp_path):
+    import pdfplumber
+    from reportlab.pdfgen import canvas
+    from backend.pdf_appearance import extract_page_appearance
+
+    pdf_path = tmp_path / 'single.pdf'
+    writer = canvas.Canvas(str(pdf_path), pagesize=(300, 400))
+    writer.drawString(40, 320, 'Hello Appearance')
+    writer.showPage()
+    writer.save()
+
+    with pdfplumber.open(pdf_path) as document:
+        page = document.pages[0]
+        page_image = page.to_image(resolution=96, antialias=True, force_mediabox=True)
+        appearance = extract_page_appearance(page, page_image)
+
+    render = appearance['render']
+    assert 'gray_png_base64' not in render
+    assert render['width'] > 0 and render['height'] > 0
+    assert isinstance(render['rgb_png_base64'], str) and len(render['rgb_png_base64']) > 0
+    assert isinstance(render['sha256'], str) and len(render['sha256']) == 64
+
+
+def test_visual_regions_supports_new_rgb_only_and_legacy_gray_only_snapshots(tmp_path):
+    import base64
+    import io
+    import pdfplumber
+    from PIL import Image
+    from reportlab.pdfgen import canvas
+    from backend.pdf_appearance import _visual_regions, extract_page_appearance
+
+    views = []
+    for name, color in (('old', (0.1, 0.1, 0.1)), ('new', (0.8, 0.2, 0.2))):
+        pdf_path = tmp_path / f'{name}.pdf'
+        writer = canvas.Canvas(str(pdf_path), pagesize=(200, 200))
+        writer.setFillColorRGB(*color)
+        writer.rect(40, 60, 120, 80, fill=1, stroke=0)
+        writer.showPage()
+        writer.save()
+        with pdfplumber.open(pdf_path) as document:
+            page = document.pages[0]
+            page_image = page.to_image(resolution=96, antialias=True, force_mediabox=True)
+            appearance = extract_page_appearance(page, page_image)
+        views.append({
+            'number': 1,
+            'scopes': [[0, 0, 1, 1]],
+            'images': [],
+            'original_lines': [],
+            'appearance': appearance,
+        })
+
+    # 新快照（不含 gray_png_base64）应正常输出视觉差异区域
+    assert 'gray_png_base64' not in views[0]['appearance']['render']
+    rgb_regions = _visual_regions(views[0], views[1], residual=False)
+    assert rgb_regions
+
+    # 构造仅含 gray_png_base64、无 rgb_png_base64 的旧快照，验证惰性回退兼容性
+    legacy_views = copy.deepcopy(views)
+    for view in legacy_views:
+        render = view['appearance']['render']
+        rgb_bytes = base64.b64decode(render.pop('rgb_png_base64'))
+        gray_image = Image.open(io.BytesIO(rgb_bytes)).convert('L')
+        buffer = io.BytesIO()
+        gray_image.save(buffer, format='PNG')
+        render['gray_png_base64'] = base64.b64encode(buffer.getvalue()).decode()
+
+    gray_regions = _visual_regions(legacy_views[0], legacy_views[1], residual=False)
+    assert gray_regions

@@ -62,9 +62,9 @@ def grid(rows, columns):
 def replace_fixture_book(client, mutate):
     store = client.app.state.store
     path = store.folder / "test-job" / "new.json"
-    book = json.loads(path.read_text())
+    book = json.loads(path.read_text(encoding='utf-8'))
     mutate(book)
-    path.write_text(encode(book))
+    path.write_text(encode(book), encoding='utf-8')
 
 
 def test_insert_move_keep_identity_sources_and_later_cell_correction(client):

@@ -47,6 +47,23 @@ def _style(cell: Any) -> dict:
     }
 
 
+def default_style() -> dict:
+    # 返回与 openpyxl 无自定义样式单元格 _style(cell) 完全一致的独立可变字典，避免共享可变状态
+    return {
+        "font": {"name": "Calibri", "size": 11.0, "bold": False, "italic": False,
+                 "underline": None, "color": {"type": "theme", "value": 1, "tint": 0.0}},
+        "fill": {"type": None,
+                 "foreground": {"type": "rgb", "value": "00000000", "tint": 0.0},
+                 "background": {"type": "rgb", "value": "00000000", "tint": 0.0}},
+        "alignment": {"horizontal": None, "vertical": None, "wrap_text": None, "rotation": 0},
+        "border": {side: {"style": None, "color": None} for side in ("left", "right", "top", "bottom")},
+        "number_format": "General",
+    }
+
+
+DEFAULT_STYLE = default_style()
+
+
 def extract_workbook(path: Path, progress=None) -> dict:
     def report(stage, current, total, completed, item_name=None):
         if progress is not None:
@@ -118,7 +135,9 @@ def extract_workbook(path: Path, progress=None) -> dict:
                         "formula": formula, "cached_value": cached_value,
                         "cached_value_type": cached_type, "cache_status": cache_status,
                         "number_format": cell.number_format,
-                        "merged_range": merge_lookup.get(cell.coordinate), "style": _style(cell),
+                        "merged_range": merge_lookup.get(cell.coordinate),
+                        # 无自定义样式时赋予独立默认样式字典，保持结构统一且可按需独立修改
+                        "style": _style(cell) if cell.has_style else default_style(),
                         "hidden_row": cell.row in hidden_rows,
                         "hidden_column": cell.column in hidden_columns,
                     }

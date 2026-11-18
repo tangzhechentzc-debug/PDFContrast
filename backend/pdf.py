@@ -16,9 +16,9 @@ from .compare import compare_workbooks
 from .excel import empty_cell, suggest_pairs
 
 
-MAX_PAGES = 100
+EAGER_PAGE_LIMIT = 100
 MAX_PAGE_PIXELS = 12_000_000
-MAX_TOTAL_PIXELS = 240_000_000
+MAX_EAGER_PIXELS = 240_000_000
 MAX_CELLS = 100_000
 _OCR_LOCK = threading.Lock()
 _RENDER_LOCK = threading.Lock()
@@ -138,25 +138,6 @@ def _line_centres(indices) -> list[int]:
     return [round(sum(group) / len(group)) for group in groups]
 
 
-def _ocr_lines(words: list[dict]) -> list[dict]:
-    lines = []
-    for word in sorted(words, key=lambda w: (w["bbox"][1], w["bbox"][0])):
-        box = word["bbox"]
-        centre = (box[1] + box[3]) / 2
-        if lines and abs(centre - lines[-1]["centre"]) <= min(box[3] - box[1], lines[-1]["height"]) / 2:
-            lines[-1]["words"].append(word)
-        else:
-            lines.append({"centre": centre, "height": box[3] - box[1], "words": [word]})
-    result = []
-    for line in lines:
-        row = sorted(line["words"], key=lambda w: w["bbox"][0])
-        result.append({"text": " ".join(w["text"] for w in row),
-                       "bbox": [min(w["bbox"][0] for w in row), min(w["bbox"][1] for w in row),
-                                max(w["bbox"][2] for w in row), max(w["bbox"][3] for w in row)],
-                       "confidence": min(w["confidence"] for w in row)})
-    return result
-
-
 def _ocr_tables(image, words: list[dict]) -> tuple[list[dict], set[int]]:
     import cv2
     import numpy as np
@@ -272,30 +253,27 @@ def _combined_lines(words: list[dict]) -> list[dict]:
 
 
 def _preserve_table_geometry(sheet, table, page_image, page_number):
-    boxes = [box for row in table.rows for box in row.cells if box is not None]
-    xs = sorted({round(value, 4) for box in boxes for value in (box[0], box[2])})
-    ys = sorted({round(value, 4) for box in boxes for value in (box[1], box[3])})
+    # 直接复用预提取的单元格合并跨度与原始 PDF 坐标，按结构坐标系归一化
     geometry, merged = [], set()
-    for row_number, row in enumerate(table.rows, 1):
-        for column, box in enumerate(row.cells, 1):
-            if box is None:
-                continue
-            c1, c2 = xs.index(round(box[0], 4)) + 1, xs.index(round(box[2], 4))
-            r1, r2 = ys.index(round(box[1], 4)) + 1, ys.index(round(box[3], 4))
-            entry = {"cell": f"{get_column_letter(column)}{row_number}", "bbox": _text_source(page_image, page_number, box)["bbox"],
-                     "row_start": r1, "row_end": r2, "column_start": c1, "column_end": c2}
-            if c2 <= sheet["max_column"] and r2 <= sheet["max_row"] and (c2 > c1 or r2 > r1):
-                name = f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}"
-                entry["merged_range"] = name
-                merged.add(name)
-                for r in range(r1, r2 + 1):
-                    for c in range(c1, c2 + 1):
-                        cell = sheet["cells"].get(f"{get_column_letter(c)}{r}")
-                        if cell:
-                            cell["merged_range"] = name
-            elif c2 > sheet["max_column"] or r2 > sheet["max_row"]:
-                entry["span_unresolved"] = True
-            geometry.append(entry)
+    for span in table["spans"]:
+        box = span["bbox"]
+        c1, c2 = span["column_start"], span["column_end"]
+        r1, r2 = span["row_start"], span["row_end"]
+        entry = {"cell": f"{get_column_letter(span['column'])}{span['row']}",
+                 "bbox": _text_source(page_image, page_number, box)["bbox"],
+                 "row_start": r1, "row_end": r2, "column_start": c1, "column_end": c2}
+        if c2 <= sheet["max_column"] and r2 <= sheet["max_row"] and (c2 > c1 or r2 > r1):
+            name = f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}"
+            entry["merged_range"] = name
+            merged.add(name)
+            for r in range(r1, r2 + 1):
+                for c in range(c1, c2 + 1):
+                    cell = sheet["cells"].get(f"{get_column_letter(c)}{r}")
+                    if cell:
+                        cell["merged_range"] = name
+        elif c2 > sheet["max_column"] or r2 > sheet["max_row"]:
+            entry["span_unresolved"] = True
+        geometry.append(entry)
     sheet["cell_geometry"] = geometry
     sheet["merged_ranges"] = sorted(merged)
 
@@ -408,7 +386,6 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
     pages = []
     sheets = []
     warnings = []
-    total_pixels = 0
     try:
         pdf = pdfplumber.open(path)
     except Exception as exc:
@@ -424,8 +401,13 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
                           **({"item_name": f"第 {current} 页"} if current else {})})
 
         report("opening")
-        if not page_count or page_count > MAX_PAGES:
-            raise ValueError(f"PDF 必须包含 1 至 {MAX_PAGES} 页，请拆分后再比较。")
+        if not page_count:
+            raise ValueError("PDF 必须至少包含 1 页。")
+        disk_backed = page_count > EAGER_PAGE_LIMIT or sum(
+            math.ceil(p.width * 2) * math.ceil(p.height * 2) for p in pdf.pages) > MAX_EAGER_PIXELS
+        if disk_backed:
+            from .pdf_assets import save_appearance
+
         for page in pdf.pages:
             number = page.page_number
             report("rendering", number, number - 1)
@@ -435,20 +417,17 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
             resolution = min(144.0, 72.0 * math.sqrt(MAX_PAGE_PIXELS / area))
             if resolution < 36:
                 raise ValueError(f"第 {number} 页尺寸过大，无法可靠渲染和定位。")
-            projected_pixels = math.ceil(page.width * resolution / 72) * math.ceil(page.height * resolution / 72)
-            if total_pixels + projected_pixels > MAX_TOTAL_PIXELS:
-                raise ValueError("PDF 累计渲染像素超过 2.4 亿，请拆分后比较。")
             try:
                 with _RENDER_LOCK:
                     page_image = page.to_image(resolution=resolution, antialias=True, force_mediabox=True)
                 image = page_image.original
-                image.save(asset_dir / f"page-{number}.png")
+                if not disk_backed:
+                    image.save(asset_dir / f"page-{number}.png")
             except Exception as exc:
                 raise ValueError(f"第 {number} 页无法渲染，不能保证原文定位。") from exc
             iw, ih = image.size
-            total_pixels += iw * ih
-            if iw * ih > MAX_PAGE_PIXELS + 10000 or total_pixels > MAX_TOTAL_PIXELS + 10000:
-                raise ValueError("PDF 渲染尺寸超过限制，请拆分后比较。")
+            if iw * ih > MAX_PAGE_PIXELS + 10000:
+                raise ValueError(f"第 {number} 页渲染尺寸超过单页限制。")
             report("text_extract", number, number - 1)
             native_words = page.extract_words()
             if len(native_words) > 20000:
@@ -479,9 +458,11 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
                         "ocr_annotations": [{**item, "bbox": _source(number, item["bbox"], iw, ih, "ocr")["bbox"]} for item in annotations],
                         "rotation": page.rotation, "media_box": list(page.mediabox), "crop_box": list(page.cropbox)}
             metadata["has_graphics"] = bool(page.lines or page.rects or page.curves or page.images)
-            from .pdf_appearance import extract_page_appearance
+            from .pdf_appearance import _extract_page_tables, extract_page_appearance
 
-            metadata["appearance"] = extract_page_appearance(page, page_image)
+            # 每页仅调用一次原生表格提取并复用给外观快照与结构表，不写入 metadata
+            raw_tables = _extract_page_tables(page)
+            metadata["appearance"] = extract_page_appearance(page, page_image, tables=raw_tables)
             appearance = metadata["appearance"]
             glyphs = glyph_geometry.resolve(page, appearance["chars"])
             corrections = []
@@ -496,6 +477,10 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
                                                            if evidence["status"] == "unverified"]}
             metadata["physical_width"] = metadata["appearance"]["width_pt"]
             metadata["physical_height"] = metadata["appearance"]["height_pt"]
+            if disk_backed:
+                save_appearance(asset_dir, metadata)
+                metadata["render_deferred"] = True
+                del appearance, glyphs, corrections
             pages.append(metadata)
             page_sheets = []
             used = set()
@@ -515,16 +500,16 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
                     source["unresolved_text"] = True
                 return source
 
-            for index, table in enumerate(page.find_tables(), 1):
-                extracted = table.extract()
+            for index, table in enumerate(raw_tables, 1):
+                extracted = table["extracted"]
                 if len(extracted) < 2 or max((len(row) for row in extracted), default=0) < 2:
                     continue
                 matrix = []
                 for row_index, row in enumerate(extracted):
                     output = []
                     for column, native_text in enumerate(row):
-                        native_box = table.rows[row_index].cells[column]
-                        box = _pixel_box(page_image, native_box or table.bbox)
+                        native_box = table["rows"][row_index][column]
+                        box = _pixel_box(page_image, native_box or table["bbox"])
                         local = [word for word in words if native_box and
                                  (_inside(word["bbox"], box) if word["method"] == "text" else _overlap_fraction(word["bbox"], box) >= .8)]
                         has_regional_text = any(word["method"] == "ocr" for word in local)
@@ -540,15 +525,15 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
                     continue
                 sheet = _make_sheet(f"第 {number} 页 · 表 {index}", matrix, structure="table", page_number=number,
                                     method="ocr" if any(src["method"] == "ocr" or src.get("unresolved_text") for row in matrix for _, src in row) else "text")
-                box = _source(number, _pixel_box(page_image, table.bbox), iw, ih, "text")["bbox"]
+                box = _source(number, _pixel_box(page_image, table["bbox"]), iw, ih, "text")["bbox"]
                 sheet.update(bbox=box, structure_source={"method": "pdf_lines", "bbox": box})
                 _preserve_table_geometry(sheet, table, page_image, number)
                 for cell in sheet["cells"].values():
                     if cell["pdf_source"].get("unresolved_text"):
                         cell["requires_review"] = True
                 page_sheets.append(sheet)
-                native_boxes.append(_pixel_box(page_image, table.bbox))
-                if any(box is None for row in table.rows for box in row.cells):
+                native_boxes.append(_pixel_box(page_image, table["bbox"]))
+                if any(box is None for row in table["rows"] for box in row):
                     warnings.append(f"第 {number} 页表 {index} 含合并或不规则单元格，请确认表头和列映射。")
             if any(word["method"] == "ocr" for word in words):
                 tables, _ = _ocr_tables(image, words)
@@ -593,14 +578,19 @@ def extract_pdf(path: Path, asset_dir: Path, progress=None) -> dict:
                 for cell in sheet["cells"].values():
                     if cell.get("pdf_source", {}).get("unresolved_text"):
                         cell["requires_review"] = True
-            if sum(len(sheet["cells"]) for sheet in sheets) > MAX_CELLS // 2:
-                raise ValueError("PDF 提取单元格过多，请拆分后比较。")
+            if sum(len(sheet["cells"]) for sheet in page_sheets) > MAX_CELLS:
+                raise ValueError(f"第 {number} 页提取单元格超过单页预算，未截断内容。")
             page.close()
+            image.close()
+            if page_image.annotated is not image:
+                page_image.annotated.close()
+            del image, page_image, raw_tables
             report("table_extract", number, number)
     from .reports import attach_report_inventory
 
     result = attach_report_inventory({"sheets": sheets, "warnings": list(dict.fromkeys(warnings)), "pages": pages, "format": "pdf",
-                                      "document_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "report_inventory_version": 2})
+                                      "document_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "report_inventory_version": 2,
+                                      **({"asset_directory": str(asset_dir.resolve()), "asset_storage": "page_files_v1"} if disk_backed else {})})
     report("file_completed", page_count, page_count)
     return result
 
@@ -735,7 +725,8 @@ def _compare_report_pdfs(old: dict, new: dict, config: dict) -> dict:
 
 
 def _compare_complete_reports(old: dict, new: dict, config: dict) -> dict:
-    from .pdf_appearance import compare_report_appearance
+    from .cost_reports import compare_cost_reports
+    from .pdf_appearance import compare_report_appearance, index_page_overlays
     from .reports import _content_blockers, _key_blockers, _pair, attach_report_inventory, compare_inventory
 
     if old.get("report_inventory_version") != 2 or new.get("report_inventory_version") != 2:
@@ -743,6 +734,7 @@ def _compare_complete_reports(old: dict, new: dict, config: dict) -> dict:
     books = {side: book if "reports" in book else attach_report_inventory(book)
              for side, book in (("old", old), ("new", new))}
     inventory = compare_inventory(books["old"], books["new"], config)
+    overlays_by_side = {side: index_page_overlays(book) for side, book in books.items()}
     diffs = []
     categories = ("content", "structure", "format", "layout")
     labels = {"content": "内容", "structure": "结构", "format": "格式", "layout": "版式"}
@@ -821,7 +813,9 @@ def _compare_complete_reports(old: dict, new: dict, config: dict) -> dict:
                                               if cell["row"] <= sheet.get("suggested_header_row", 1) and cell.get("pdf_source")), default=box[1])
                                 exclusions[side].append({"page": sheet["page_number"], "bbox": box})
                         appearance_entry = {**entry, "content_exclusions": exclusions}
-            comparison = compare_report_appearance(books["old"], books["new"], appearance_entry)
+            from .pdf_assets import report_appearances
+            with report_appearances(books, appearance_entry):
+                comparison = compare_report_appearance(books["old"], books["new"], appearance_entry, overlays_by_side=overlays_by_side)
             if structured is not None:
                 emitted_structured = []
                 for diff in structured["diffs"]:
@@ -925,6 +919,13 @@ def _compare_complete_reports(old: dict, new: dict, config: dict) -> dict:
                               "old_value": entry["title"] if removed else None, "new_value": None if removed else entry["title"],
                               "delta": None, "message": entry["basis"], "severity": "change",
                               "old_source": report["source"] if removed else None, "new_source": None if removed else report["source"]})
+
+    business = compare_cost_reports(books["old"], books["new"], inventory)
+    diffs.extend(business["diffs"])
+    business_by_report = {item["report_id"]: item for item in business["reports"]}
+    for entry in inventory["reports"]:
+        if entry["id"] in business_by_report:
+            entry["business"] = business_by_report[entry["id"]]
 
     if not inventory["reports"]:
         inventory["issues"].append({"id": "issue-no-reports", "type": "inventory", "message": "未识别出对应业务报表；文档区域仍保留，不能判为一致。",

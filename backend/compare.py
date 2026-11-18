@@ -5,11 +5,9 @@ import re
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation, localcontext
 
-import pandas as pd
-from datacompy import PandasCompare
 from openpyxl.utils import column_index_from_string, range_boundaries
 
-from .excel import get_cell, get_sheet, parse_bounds, sheet_columns
+from .excel import DEFAULT_STYLE, get_cell, get_sheet, parse_bounds, sheet_columns
 
 
 def _effective(cell: dict) -> tuple[str, object]:
@@ -268,45 +266,40 @@ def compare_workbooks(old: dict, new: dict, config: dict) -> dict:
                         src if side == "old" else None, src if side == "new" else None,
                         row_key=labels[token], message="业务键在至少一侧重复；请补充复合键后重新比较，此行未被强制配对。", severity="issue")
         valid = {side: {key: rs[0] for key, rs in groups.items()} for side, groups in rows_by_key.items()}
-        frame_columns = ["__key"] + [f"v{i}" for i in range(len(common))]
-        frames = {}
-        for side, sheet in (("old", left), ("new", right)):
-            records = []
+        # 使用原生 Python 字典集合运算与 _token 比对两侧唯一行及共有行，保持原有行遍历顺序
+        unique_col = {side: column_index_from_string((keys or common)[0][f"{side}_column"]) for side in ("old", "new")}
+        for side, opposite, sheet in (("old", "new", left), ("new", "old", right)):
             for key, row in valid[side].items():
-                records.append([key] + [_token(get_cell(sheet, row, column_index_from_string(m[f"{side}_column"])), trim)
-                                        for m in common])
-            frames[side] = pd.DataFrame(records, columns=frame_columns, dtype=object)
-        comparison = PandasCompare(frames["old"], frames["new"], join_columns="__key", abs_tol=0, rel_tol=0,
-                                   df1_name="old", df2_name="new", cast_column_names_lower=False)
-        for side, unique_rows, sheet in (("old", comparison.df1_unq_rows, left), ("new", comparison.df2_unq_rows, right)):
-            for key in unique_rows["__key"].tolist():
-                row = valid[side][key]
-                col = column_index_from_string((keys or common)[0][f"{side}_column"])
-                src = _source(sheet, row, col)
-                unresolved_opposite = unknown_keys["new" if side == "old" else "old"] > 0
+                if key in valid[opposite]:
+                    continue
+                src = _source(sheet, row, unique_col[side])
+                unresolved_opposite = unknown_keys[opposite] > 0
                 add(pair, "match_ambiguous" if unresolved_opposite else "row_removed" if side == "old" else "row_added", "整行",
                     labels[key] if side == "old" else None, labels[key] if side == "new" else None,
                     src if side == "old" else None, src if side == "new" else None,
                     row_key=labels[key],
                     message="对侧存在空白或不可用业务键，无法确定本行是否为增删；请修正业务键后重跑。" if unresolved_opposite else "按当前匹配规则，该项目只存在于一侧；整行增删记为一个事件。",
                     severity="issue" if unresolved_opposite else "change")
-        for _, aligned in comparison.intersect_rows.iterrows():
-            key = aligned["__key"]
-            lr, rr = valid["old"][key], valid["new"][key]
+        common_columns = [
+            (m.get("name") or m["id"], column_index_from_string(m["old_column"]), column_index_from_string(m["new_column"]))
+            for m in common
+        ]
+        for key, lr in valid["old"].items():
+            if key not in valid["new"]:
+                continue
+            rr = valid["new"][key]
             before = len(diffs)
             stats["matched_rows"] += 1
-            for index, m in enumerate(common):
-                lc, rc = column_index_from_string(m["old_column"]), column_index_from_string(m["new_column"])
+            for field, lc, rc in common_columns:
                 a, b = get_cell(left, lr, lc), get_cell(right, rr, rc)
                 old_src, new_src = _source(left, lr, lc), _source(right, rr, rc)
-                field = m.get("name") or m["id"]
                 ka, va = _effective(a)
                 kb, vb = _effective(b)
                 stats["compared_cells"] += 1
                 if ka in ("unavailable", "error") or kb in ("unavailable", "error"):
                     add(pair, "formula_result_unavailable", field, _display(a), _display(b), old_src, new_src,
                         row_key=labels[key], message="至少一侧的公式缓存缺失或单元格为 Excel 错误值，无法确认结果一致；未重算公式。", severity="issue")
-                elif not bool(aligned[f"v{index}_match"]):
+                elif _token(a, trim) != _token(b, trim):
                     delta = None
                     equal = False
                     if ka == kb == "number":
@@ -324,13 +317,16 @@ def compare_workbooks(old: dict, new: dict, config: dict) -> dict:
                 if formulas and a["formula"] != b["formula"]:
                     add(pair, "formula_changed", field, a["formula"], b["formula"], old_src, new_src,
                         row_key=labels[key], message="公式文本发生变化；文件保存的结果单独比较，不执行公式。")
-                if formatting and a.get("style") != b.get("style"):
-                    old_style, new_style = a.get("style") or {}, b.get("style") or {}
-                    categories = [label for attr, label in (("font", "字体"), ("fill", "填充"), ("border", "边框"),
-                                                            ("alignment", "对齐"), ("number_format", "数字格式"))
-                                  if old_style.get(attr) != new_style.get(attr)]
-                    add(pair, "format_changed", field, a.get("number_format"), b.get("number_format"), old_src, new_src,
-                        row_key=labels[key], message=f"变化属性：{'、'.join(categories)}。旧值/新值栏显示数字格式，其他属性可在两侧原单元格查看；数值独立比较。")
+                if formatting:
+                    # 空白格或缺失样式先兜底为统一默认样式，再判不等，避免误报 5 项样式差异或空属性列表
+                    old_style = a.get("style") or DEFAULT_STYLE
+                    new_style = b.get("style") or DEFAULT_STYLE
+                    if old_style != new_style:
+                        categories = [label for attr, label in (("font", "字体"), ("fill", "填充"), ("border", "边框"),
+                                                                ("alignment", "对齐"), ("number_format", "数字格式"))
+                                      if old_style.get(attr) != new_style.get(attr)]
+                        add(pair, "format_changed", field, a.get("number_format"), b.get("number_format"), old_src, new_src,
+                            row_key=labels[key], message=f"变化属性：{'、'.join(categories)}。旧值/新值栏显示数字格式，其他属性可在两侧原单元格查看；数值独立比较。")
             if len(diffs) == before:
                 stats["unchanged_rows"] += 1
     excluded = {"old": [s["name"] for s in old["sheets"] if s["name"] not in compared["old"]],

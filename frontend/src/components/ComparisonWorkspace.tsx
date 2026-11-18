@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
-import { dimensionLabels, dimensionStatusLabels, kindLabels, messageOf, request, sourceLabel } from '../api';
-import type { ComparisonDimension, Diff, DiffPage, Job, ResultLocation, Run } from '../types';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { businessStatusLabels, categoryLabels, dimensionLabels, dimensionStatusLabels, kindLabels, messageOf, request, sourceLabel } from '../api';
+import type { RefObject } from 'react';
+import type { ComparisonDimension, Diff, DiffPage, Job, ParagraphCheckPage, ParagraphCheckSummary, ReportComparison, ResultLocation, Run } from '../types';
 import SheetViewer from './SheetViewer';
 import PdfViewer from './PdfViewer';
 import PdfReportOverview from './PdfReportOverview';
@@ -12,6 +13,55 @@ import DiffText from './DiffText';
 const PAGE_SIZE = 100;
 const paragraphAttributeLabels = { line_spacing: '段落行距', alignment: '段落左 / 中 / 右对齐' };
 const paragraphStatusLabels = { changed: '有变化', unchanged: '未发现变化', unverified: '未验证' };
+
+function formatPageRanges(pages: number[] = []) {
+  const ranges: [number, number][] = [];
+  for (const page of [...new Set(pages)].sort((a, b) => a - b)) {
+    const last = ranges.at(-1);
+    if (last && last[1] + 1 === page) last[1] = page;
+    else ranges.push([page, page]);
+  }
+  return ranges.map(([first, last]) => first === last ? String(first) : `${first}–${last}`).join('、');
+}
+
+function ParagraphChecks({ runId, report, summary, detailsRef, onLocate }: { runId: string; report: ReportComparison; summary: ParagraphCheckSummary | null; detailsRef: RefObject<HTMLDetailsElement | null>; onLocate: (location: ResultLocation) => void }) {
+  const [opened, setOpened] = useState(false);
+  const [offset, setOffset] = useState(0);
+  const [page, setPage] = useState<ParagraphCheckPage | null>(null);
+  const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
+  const inline = report.paragraph_checks;
+
+  useEffect(() => {
+    if (!opened || inline || !summary?.total) return;
+    const controller = new AbortController();
+    setPage(null); setError('');
+    const params = new URLSearchParams({ report_id: report.id, offset: String(offset), limit: String(PAGE_SIZE) });
+    request<ParagraphCheckPage>(`/api/runs/${runId}/paragraph-checks?${params}`, { signal: controller.signal })
+      .then(result => { if (!controller.signal.aborted) setPage(result); })
+      .catch(reason => { if (!controller.signal.aborted) setError(messageOf(reason)); });
+    return () => controller.abort();
+  }, [opened, inline, summary?.total, report.id, runId, offset, retry]);
+
+  const items = inline ? inline.slice(offset, offset + PAGE_SIZE) : page?.offset === offset ? page.items : null;
+  const total = inline?.length ?? page?.total ?? summary?.total ?? 0;
+  const loading = total > 0 && !items && !error;
+  function move(nextOffset: number) {
+    setPage(null); setError(''); setOffset(nextOffset);
+  }
+  return <details ref={detailsRef} className="coverage-details" data-testid="paragraph-checks" onToggle={event => setOpened(event.currentTarget.open)}>
+    <summary>段落行距与对齐检查{summary ? ` · 共 ${summary.total} 项 · 变化 ${summary.changed} 项 · 未发现变化 ${summary.unchanged} 项 · 未验证 ${summary.unverified} 项` : ' · 本次未记录'}</summary>
+    {opened && <>
+      {loading && <p role="status">正在读取段落检查…</p>}
+      {error && <p className="error-banner" role="alert">段落检查读取失败：{error}<button type="button" onClick={() => { setError(''); setRetry(value => value + 1); }}>重试</button></p>}
+      {total > 0 && <div className="toolbar compact" aria-label="段落检查分页">
+        <span>共 {total} 项 · 第 {Math.floor(offset / PAGE_SIZE) + 1} / {Math.ceil(total / PAGE_SIZE)} 页{items?.length ? ` · 当前 ${offset + 1}–${offset + items.length} 项` : ''}</span>
+        <div className="actions"><button type="button" disabled={loading || offset === 0} onClick={() => move(Math.max(0, offset - PAGE_SIZE))}>上一页检查</button><button type="button" disabled={loading || offset + PAGE_SIZE >= total} onClick={() => move(offset + PAGE_SIZE)}>下一页检查</button></div>
+      </div>}
+      {items && items.length > 0 ? <div className="table-scroll"><table style={{ minWidth: '44rem' }}><thead><tr><th>检查属性</th><th>判定</th><th>旧版结果 / 页码</th><th>新版结果 / 页码</th><th>依据与验证范围</th></tr></thead><tbody>{items.map((check, index) => <tr key={`${check.attribute}:${offset + index}`}><td>{paragraphAttributeLabels[check.attribute]}</td><td className={check.status === 'unverified' ? 'warning-text' : undefined}>{paragraphStatusLabels[check.status]}</td>{(['old', 'new'] as const).map(side => <td key={side}><p>{check[`${side}_value`] ?? '未提供测量结果'}</p>{check[`${side}_source`] ? <button onClick={() => onLocate({ id: `paragraph:${report.id}:${offset + index}`, report_id: report.id, title: `${report.title} / ${paragraphAttributeLabels[check.attribute]}`, message: check.message, old_source: check.old_source, new_source: check.new_source })}>查看{side === 'old' ? '旧版' : '新版'}{sourceLabel(check[`${side}_source`], true)}</button> : <span className="small muted">未提供原页定位</span>}</td>)}<td>{check.message}</td></tr>)}</tbody></table></div> : !total && <p className="muted">此结果没有段落行距与对齐的检查记录，不能据此认定这些属性相同。</p>}
+    </>}
+  </details>;
+}
 
 export default function ComparisonWorkspace({ job, run, onConfigure, onReview, onReprocess, actionBusy }: { job: Job; run: Run; onConfigure: () => void; onReview: () => void; onReprocess: () => void; actionBusy: boolean }) {
   const pdf = job.kind === 'pdf';
@@ -29,11 +79,13 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
   const originalsRef = useRef<HTMLDivElement>(null);
   const evidenceHeading = useRef<HTMLHeadingElement>(null);
   const overview = useRef<HTMLDetailsElement>(null);
+  const comparisonBasis = useRef<HTMLDetailsElement>(null);
+  const paragraphDetails = useRef<HTMLDetailsElement>(null);
   const snapshotJob = run.review_pages ? { ...job, files: { old: { ...job.files.old, pages: run.review_pages.old }, new: { ...job.files.new, pages: run.review_pages.new } } } : job;
   const hasOcr = pdf && [...(snapshotJob.files.old.pages ?? []), ...(snapshotJob.files.new.pages ?? [])].some(page => page.method === 'ocr' && !page.reviewed);
   const Viewer = pdf ? PdfViewer : SheetViewer;
   const isOcrDiff = (diff: Diff) => pdf && diff.severity === 'issue' && (diff.old_source?.method === 'ocr' || diff.new_source?.method === 'ocr' || diff.kind.startsWith('ocr_'));
-  const labelFor = (diff: Diff) => isOcrDiff(diff) && (diff.kind.endsWith('added') || diff.kind.endsWith('removed')) ? `疑似${kindLabels[diff.kind] ?? '增删变化'}` : kindLabels[diff.kind] ?? (fullReportMode && diff.category && diff.category !== 'completeness' ? `${dimensionLabels[diff.category]}${diff.severity === 'issue' ? '待核验' : '变化'}` : diff.kind);
+  const labelFor = (diff: Diff) => isOcrDiff(diff) && (diff.kind.endsWith('added') || diff.kind.endsWith('removed')) ? `疑似${kindLabels[diff.kind] ?? '增删变化'}` : kindLabels[diff.kind] ?? (fullReportMode && diff.category && diff.category !== 'completeness' ? `${categoryLabels[diff.category]}${diff.severity === 'issue' ? '待核验' : '变化'}` : diff.kind);
   function displayValue(diff: Diff, side: 'old' | 'new'): string {
     const value = diff[`${side}_value`];
     if (value !== null) return value;
@@ -128,6 +180,12 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
     requestAnimationFrame(() => evidenceHeading.current?.focus());
   }
 
+  function returnToList() {
+    const target = listRef.current?.querySelector<HTMLButtonElement>('[aria-pressed="true"]') ?? document.getElementById('diff-search');
+    target?.focus({ preventScroll: true });
+    target?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+
   function locate(value: ResultLocation) {
     setLocation(value);
     if (fullReportMode) {
@@ -171,6 +229,27 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
   }, [fullReportMode, reportId]);
 
   const selectedReport = run.reports?.find(report => report.id === reportId) ?? null;
+  const paragraphSummary = useMemo(() => {
+    const inline = selectedReport?.paragraph_checks;
+    return selectedReport?.paragraph_check_summary ?? (inline ? {
+      total: inline.length,
+      changed: inline.filter(check => check.status === 'changed').length,
+      unchanged: inline.filter(check => check.status === 'unchanged').length,
+      unverified: inline.filter(check => check.status === 'unverified').length,
+    } : null);
+  }, [selectedReport]);
+  const unverifiedParagraphs = paragraphSummary?.unverified ?? 0;
+
+  function openParagraphChecks() {
+    const details = paragraphDetails.current;
+    if (!details || !comparisonBasis.current) return;
+    comparisonBasis.current.open = true;
+    details.open = true;
+    const summary = details.querySelector('summary');
+    summary?.focus({ preventScroll: true });
+    summary?.scrollIntoView({ block: 'start' });
+  }
+
   const evidenceReport = location
     ? run.reports?.find(report => report.id === location.report_id) ?? null
     : selectedReport ?? run.reports?.find(report => report.id === selected?.report_id) ?? null;
@@ -180,6 +259,13 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
   const oldSource = location ? location.old_source : selected?.old_source ?? null;
   const newSource = location ? location.new_source : selected?.new_source ?? null;
   const sourceSelection = location?.id ?? (selected ? `${selected.id}:${selectionRevision}` : null);
+  const evidenceRecord = location ? null : selected;
+  const evidenceFilter = [
+    category !== 'all' && category !== evidenceRecord?.category ? categoryLabels[category as keyof typeof categoryLabels] : '',
+    layer === 'uncertainty' ? '待确认 / 未验证' : layer === 'completeness' ? '完整性事件' : '',
+    kind !== 'all' ? kindLabels[kind] : '',
+    search !== evidenceRecord?.row_key ? search : '',
+  ].filter(Boolean).join(' · ');
   const excluded = [...run.coverage.excluded_sheets.old.map(s => `旧版「${s}」`), ...run.coverage.excluded_sheets.new.map(s => `新版「${s}」`)];
   const hasIssues = hasOcr || run.status === 'completed_with_issues' || run.summary.issues > 0 || excluded.length > 0 || run.coverage.warnings.length > 0;
   const hasSuspectedDifferences = (run.summary.by_kind.ocr_suspected ?? 0) > 0;
@@ -213,22 +299,30 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
         <label className="report-picker">当前报表
           <select id="current-report" aria-label="当前完整报表" value={reportId} onChange={event => changeFilters(layer, event.target.value, category)}>
             <option value="">全部报表事件 / 独立原页浏览</option>
-            {run.reports?.map(report => <option key={report.id} value={report.id}>{report.type_code ? `${report.type_code} · ` : ''}{report.title} · 旧 {report.old?.pages.join('、') || '无'} / 新 {report.new?.pages.join('、') || '无'}</option>)}
+            {run.reports?.map(report => <option key={report.id} value={report.id}>{report.type_code ? `${report.type_code} · ` : ''}{report.title} · 旧 {formatPageRanges(report.old?.pages) || '无'} / 新 {formatPageRanges(report.new?.pages) || '无'}</option>)}
           </select>
         </label>
         <div className="report-identity">
           <h2>{selectedReport ? `${selectedReport.type_code ? `${selectedReport.type_code} · ` : ''}${selectedReport.title}` : '全部报表事件'}</h2>
-          {selectedReport && <p className="small muted">旧版页码 {selectedReport.old?.pages.join('、') || '无对应页'} / 新版页码 {selectedReport.new?.pages.join('、') || '无对应页'}{selectedReport.confirmation === 'pending' ? ' · 对应关系待确认' : ''}</p>}
+          {selectedReport && <p className="small muted">旧版页码 {formatPageRanges(selectedReport.old?.pages) || '无对应页'} / 新版页码 {formatPageRanges(selectedReport.new?.pages) || '无对应页'}{selectedReport.confirmation === 'pending' ? ' · 对应关系待确认' : ''}</p>}
         </div>
       </div>
-      {selectedReport && <div className="selected-dimensions" aria-label="当前报表四维摘要">
+      {selectedReport && <div className="selected-dimensions" aria-label="当前报表比较摘要">
         {(Object.keys(dimensionLabels) as ComparisonDimension[]).map(dimension => {
           const result = selectedReport.dimensions?.[dimension];
-          return <button key={dimension} aria-pressed={category === dimension} onClick={() => changeFilters(layer, reportId, category === dimension ? 'all' : dimension)}>
-            <span className="dimension-title">{dimensionLabels[dimension]} <span>{result ? dimensionStatusLabels[result.status] : '尚未计算'}</span></span>
-            <span className={result?.issues ? 'warning-text' : 'muted'}>{result ? `${result.changes} 项变化 · ${result.issues} 项待核对` : '无当次结果'}</span>
-          </button>;
+          const hasUnverified = dimension === 'format' && unverifiedParagraphs > 0;
+          return <div className="dimension-summary" key={dimension}>
+            <button aria-pressed={category === dimension} onClick={() => changeFilters(layer, reportId, category === dimension ? 'all' : dimension)}>
+              <span className="dimension-title">{dimensionLabels[dimension]} <span>{hasUnverified && result?.status === 'unchanged' ? '已比较部分未发现变化' : result ? dimensionStatusLabels[result.status] : '尚未计算'}</span></span>
+              <span className={result?.issues ? 'warning-text' : 'muted'}>{result ? `${result.changes} 项差异事件 · ${result.issues} 项待核对事件` : '无当次结果'}</span>
+            </button>
+            {hasUnverified && <button type="button" className="paragraph-check-link" onClick={openParagraphChecks}>段落属性 {unverifiedParagraphs} 项未验证 · 查看明细</button>}
+          </div>;
         })}
+        {selectedReport.business && <button aria-pressed={category === 'business'} onClick={() => changeFilters('all', reportId, category === 'business' ? 'all' : 'business')}>
+          <span className="dimension-title">业务数据 <span>{businessStatusLabels[selectedReport.business.status]}</span></span>
+          <span className={selectedReport.business.issues.length ? 'warning-text' : 'muted'}>已比较 {selectedReport.business.compared_rows} 行 · {selectedReport.business.compared_fields} 个字段</span>
+        </button>}
       </div>}
     </section>}
     {fullReportMode && <div className="result-disclosures">
@@ -237,7 +331,7 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
         {overviewOpened && <PdfFullReportOverview run={run} busy={actionBusy} onOpen={(id, dimension) => filterLayer('all', id, dimension ?? 'all')} onLocate={locate} onConfigure={onConfigure} />}
       </details>
       {historyPanel}
-      <details className="coverage-details"><summary>比较范围与判定依据{hasIssues && <span className="warning-text"> · 有待核对或未比较范围</span>}</summary>
+      <details className="coverage-details" ref={comparisonBasis}><summary>比较范围与判定依据{hasIssues && <span className="warning-text"> · 有待核对或未比较范围</span>}</summary>
         {selectedReport && <div className="report-basis"><h3>{selectedReport.title}</h3><p>{selectedReport.basis}</p>
           {!!selectedReport.blocking_reasons.length && <ul>{selectedReport.blocking_reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
           <div className="report-dimension-basis">{(Object.keys(dimensionLabels) as ComparisonDimension[]).map(dimension => {
@@ -247,20 +341,24 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
               {!!result?.limitations.length && <ul>{result.limitations.map((item, index) => <li key={index}>{item}</li>)}</ul>}
             </details>;
           })}</div>
-          <details className="coverage-details" data-testid="paragraph-checks"><summary>段落行距与对齐检查{selectedReport.paragraph_checks ? ` · 变化 ${selectedReport.paragraph_checks.filter(check => check.status === 'changed').length} 项 · 未发现变化 ${selectedReport.paragraph_checks.filter(check => check.status === 'unchanged').length} 项 · 未验证 ${selectedReport.paragraph_checks.filter(check => check.status === 'unverified').length} 项` : ' · 本次未记录'}</summary>{selectedReport.paragraph_checks?.length ? <div className="table-scroll"><table style={{ minWidth: '44rem' }}><thead><tr><th>检查属性</th><th>判定</th><th>旧版结果 / 页码</th><th>新版结果 / 页码</th><th>依据与验证范围</th></tr></thead><tbody>{selectedReport.paragraph_checks.map((check, index) => <tr key={`${check.attribute}:${index}`}><td>{paragraphAttributeLabels[check.attribute]}</td><td className={check.status === 'unverified' ? 'warning-text' : undefined}>{paragraphStatusLabels[check.status]}</td>{(['old', 'new'] as const).map(side => <td key={side}><p>{check[`${side}_value`] ?? '未提供测量结果'}</p>{check[`${side}_source`] ? <button onClick={() => locate({ id: `paragraph:${selectedReport.id}:${index}`, report_id: selectedReport.id, title: `${selectedReport.title} / ${paragraphAttributeLabels[check.attribute]}`, message: check.message, old_source: check.old_source, new_source: check.new_source })}>查看{side === 'old' ? '旧版' : '新版'}{sourceLabel(check[`${side}_source`], true)}</button> : <span className="small muted">未提供原页定位</span>}</td>)}<td>{check.message}</td></tr>)}</tbody></table></div> : <p className="muted">此结果没有段落行距与对齐的检查记录，不能据此认定这些属性相同。</p>}</details>
+          {selectedReport.business && <details className="coverage-details"><summary>业务数据 · {businessStatusLabels[selectedReport.business.status]}</summary>
+            <p>D.1 / D.2 / D.3 汇总和 E.1 清单按业务字段比较，数字写法相同数值视为一致；原文与版式变化仍保留在原四个维度。已比较 {selectedReport.business.compared_rows} 行、{selectedReport.business.compared_fields} 个字段。</p>
+            {selectedReport.business.issues.length > 0 && <ul>{selectedReport.business.issues.map((issue, index) => <li key={index}>{issue}</li>)}</ul>}
+          </details>}
+          <ParagraphChecks key={`${run.id}:${selectedReport.id}`} runId={run.id} report={selectedReport} summary={paragraphSummary} detailsRef={paragraphDetails} onLocate={locate} />
         </div>}
         {coveragePanel}
       </details>
     </div>}
     {pdf && !fullReportMode && historyPanel}
     <div className={`workspace ${fullReportMode ? 'full-report-workspace' : ''}`} ref={originalsRef}><aside className="sidebar"><h2>{fullReportMode ? '差异与待核对记录' : hasReportInventory ? layer === 'content' ? '可靠内容差异' : layer === 'uncertainty' ? '待确认记录' : layer === 'completeness' ? '完整性事件' : '全部事件' : '差异明细'}</h2> {fullReportMode && <div className="record-filters">
-        <label>维度<select aria-label="比较维度" value={category} onChange={event => changeFilters(layer, reportId, event.target.value)}><option value="all">全部维度</option>{Object.entries(dimensionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label>维度<select aria-label="比较维度" value={category} onChange={event => changeFilters(layer, reportId, event.target.value)}><option value="all">全部维度</option>{Object.entries(categoryLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
         <label>范围<select aria-label="完整报表事件范围" value={layer} onChange={event => changeFilters(event.target.value, reportId, category)}><option value="all">全部事件</option><option value="completeness">完整性事件</option><option value="uncertainty">待确认 / 未验证</option></select></label>
       </div>}<label className="label" htmlFor="diff-search">按项目、字段或内容查找</label><input id="diff-search" type="search" className="search" placeholder={fullReportMode ? "搜索字段、原值或新值" : "例如 A001、金额"} value={query} onChange={e => { setLocation(null); setQuery(e.target.value); }} /><label className="sr-only" htmlFor="kind-filter">差异类型</label><select id="kind-filter" className="kind-filter" value={kind} onChange={e => { if (fullReportMode) changeFilters(layer, reportId, category, e.target.value); else { setLocation(null); setKind(e.target.value); setOffset(0); } }}><option value="all">全部类型</option>{Object.entries(kindLabels).filter(([key]) => (run.summary.by_kind[key] ?? 0) > 0).map(([key, label]) => <option key={key} value={key}>{label}{!fullReportMode && `（${run.summary.by_kind[key]}）`}</option>)}</select>
       {error && <div className="error-banner" role="alert">{fullReportMode ? `差异记录加载失败：${error}` : error}<button onClick={() => { const filter = document.getElementById('kind-filter'); if (fullReportMode && filter) filter.focus({ preventScroll: true }); setReload(n => n + 1); }}>重试读取</button></div>}
       {fullReportMode && <button type="button" className="skip-record-list" onClick={focusEvidence}>查看当前记录与原文</button>}
-      <div className="diff-list" ref={listRef} aria-label="选择差异" aria-busy={busy}>{busy ? <div className="empty" role="status">正在读取差异记录…</div> : error ? null : page?.items.length ? page.items.map(diff => <button key={diff.id} className={`diff-item ${!location && diff.id === selected?.id ? 'active' : ''}`} aria-pressed={!location && diff.id === selected?.id} onClick={() => { setLocation(null); setSelected(diff); setSelectionRevision(n => n + 1);
-        if (fullReportMode && window.matchMedia('(max-width: 1000px)').matches) focusEvidence(); }}><span className={`kind ${diff.severity === 'issue' ? 'warning-text' : ''}`}>{fullReportMode ? <>{diff.category ? diff.category === 'completeness' ? '完整性 · ' : `${dimensionLabels[diff.category]} · ` : ''}{diff.severity === 'issue' ? '待核对' : '有变化'}</> : labelFor(diff)}</span>
+      <div className="diff-list" ref={listRef} aria-label="选择差异" aria-busy={busy}>{busy ? <div className="empty" role="status">正在读取差异记录…</div> : error ? null : page?.items.length ? page.items.map(diff => <button key={diff.id} className={`diff-item ${!location && diff.id === selected?.id ? 'active' : ''}`} aria-pressed={!location && diff.id === selected?.id} onClick={event => { setLocation(null); setSelected(diff); setSelectionRevision(n => n + 1);
+        if (fullReportMode && (event.detail === 0 || window.matchMedia('(max-width: 1000px)').matches)) focusEvidence(); }}><span className={`kind ${diff.severity === 'issue' ? 'warning-text' : ''}`}>{fullReportMode ? <>{diff.category ? diff.category === 'completeness' ? '完整性 · ' : `${categoryLabels[diff.category]} · ` : ''}{diff.severity === 'issue' ? '待核对' : '有变化'}</> : labelFor(diff)}</span>
         <strong>{fullReportMode ? labelFor(diff) : diff.row_key || diff.table_name}</strong>
         <span className="diff-field">{fullReportMode ? diff.field || diff.row_key : diff.field || diff.table_name}</span>
         {fullReportMode ? <>{diff.old_value !== diff.new_value ? <span className="diff-card-values">{(['old', 'new'] as const).map(side => <small key={side}><b>{side === 'old' ? '旧' : '新'}</b><span><DiffText diff={diff} side={side} fallback={displayValue(diff, side)} preview /></span></small>)}</span> : <small>{diff.row_key || diff.message}</small>}</> : <small>{displayValue(diff, 'old')} → {displayValue(diff, 'new')}</small>}</button>) : <div className="empty">{fullReportMode ? hasFilters ? '当前筛选没有匹配记录。' : notCompared ? '当前报表没有可用的比较结果，请查看判定依据。' : noChanges ? '本报表已比较范围内未发现变化。' : '本范围没有差异记录，请查看比较范围与待核对项。' : hasReportInventory && layer === 'content' ? '本层没有符合条件的可靠内容差异；请同时核对报表完整性和下方待处理区域。' : run.summary.total ? '没有符合筛选条件的差异。' : hasIssues ? '没有确定差异，请查看上方范围和待核对提示。' : '所选范围内没有差异。'}{(fullReportMode ? hasFilters : query || kind !== 'all') && <button onClick={() => {
@@ -275,7 +373,7 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
           {selected && !location && <p className="small muted">{[selected.field, selected.row_key].filter(Boolean).join(' · ')}</p>}
         </div>
         <div className="evidence-nav">
-          <button type="button" className="return-to-list" onClick={() => (listRef.current?.querySelector<HTMLButtonElement>('[aria-pressed="true"]') ?? document.getElementById('diff-search'))?.focus()}>返回列表</button>
+          <button type="button" onClick={returnToList}>返回列表</button>
           {location ? <button onClick={() => { setLocation(null); focusEvidence(); }}>返回上次差异</button> : <>
             <button aria-disabled={busy || absoluteIndex <= 0} onClick={() => { if (!busy && absoluteIndex > 0) move(-1); }}>上一条</button>
             <span role="status"><span className="sr-only">当前筛选中的记录位置 </span>{absoluteIndex >= 0 && page ? `${absoluteIndex + 1} / ${page.total}` : '—'}</span>
@@ -296,7 +394,7 @@ export default function ComparisonWorkspace({ job, run, onConfigure, onReview, o
         {['text_whitespace_changed', 'line_break_changed'].includes(selected.kind) && <p className="small muted">␠ 空格 · □ 全角空格 · ⇥ 制表符 · ↵ 换行</p>}
       </> : <p className="small muted">{busy ? '正在读取差异记录。' : '可通过页面对应或手动选页查看原件。'}</p>}
     </section>
-    <PdfComparisonViewer job={snapshotJob} report={evidenceReport} oldSource={oldSource} newSource={newSource} selectionId={sourceSelection} />
+    <PdfComparisonViewer job={snapshotJob} report={evidenceReport} record={evidenceRecord} activeFilter={evidenceFilter} oldSource={oldSource} newSource={newSource} selectionId={sourceSelection} />
     </div> : <div className="viewers"><Viewer job={snapshotJob} side="old" source={oldSource} selectionId={sourceSelection} isIssue={!!location || selected?.severity === 'issue'} /><Viewer job={snapshotJob} side="new" source={newSource} selectionId={sourceSelection} isIssue={!!location || selected?.severity === 'issue'} /></div>}
     {!fullReportMode && <section className="diff-detail" aria-live="polite"><div className="section-heading"><h2>{location ? location.title : selected ? `${selected.row_key || selected.table_name}${selected.field ? ` / ${selected.field}` : ''}` : '差异详情'}</h2><div className="actions"><button disabled={busy || absoluteIndex <= 0} onClick={() => move(-1)}>← 上一条</button><button disabled={busy || absoluteIndex < 0 || !page || absoluteIndex >= page.total - 1} onClick={() => move(1)}>下一条 →</button></div></div>
       {location ? <><p className="explanation">{location.message}</p><div className="source-addresses"><span>旧版：{sourceLabel(location.old_source, true)}</span><span>新版：{sourceLabel(location.new_source, true)}</span></div><div className="actions"><button disabled={actionBusy} onClick={onConfigure}>确认配对与规则</button><button disabled={actionBusy} onClick={onReview}>校正与核验 OCR</button></div></> : selected ? <><div className="detail-grid"><div><span className="label">旧值</span><div className="value"><DiffText diff={selected} side="old" fallback={displayValue(selected, 'old')} /></div></div><div><span className="label">新值</span><div className="value"><DiffText diff={selected} side="new" fallback={displayValue(selected, 'new')} /></div></div><div><span className="label">差额（新版 − 旧版）</span><div className="value">{isOcrDiff(selected) ? selected.delta !== null ? `${selected.delta}（识别值差额，待核验）` : '待核验' : selected.delta ?? '不适用'}</div></div></div><span className={`chip ${selected.severity === 'issue' ? 'warn' : ''}`}>{selected.severity === 'issue' ? '◇ 待核对' : '△ 已检测，尚未人工复核'}</span><p className="explanation">{selected.message}</p><div className="source-addresses"><span>旧版：{sourceLabel(selected.old_source, pdf)}</span><span>新版：{sourceLabel(selected.new_source, pdf)}</span></div></> : <p className="muted">{busy ? '读取后自动定位第一条差异。' : '选择一条差异查看原始位置与判定依据。'}</p>}

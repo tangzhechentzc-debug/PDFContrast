@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import './PdfComparisonViewer.css';
-import type { Job, ReportComparison, Side, Source } from '../types';
-import { sourceLabel } from '../api';
+import type { Diff, Job, ReportComparison, Side, Source } from '../types';
+import { categoryLabels, sourceLabel } from '../api';
 
 type ViewMode = 'side' | 'switch' | 'overlay';
+type ImageRequest = { attempt: number; status: 'loading' | 'loaded' | 'failed' };
 const sides = ['old', 'new'] as const;
 const sideLabels = { old: '旧版', new: '新版' };
 
@@ -19,7 +20,7 @@ function regionOf(source: Source | null, page?: number) {
   };
 }
 
-export default function PdfComparisonViewer({ job, report, oldSource, newSource, selectionId }: { job: Job; report: ReportComparison | null; oldSource: Source | null; newSource: Source | null; selectionId: string | null }) {
+export default function PdfComparisonViewer({ job, report, record, activeFilter, oldSource, newSource, selectionId }: { job: Job; report: ReportComparison | null; record: Diff | null; activeFilter: string; oldSource: Source | null; newSource: Source | null; selectionId: string | null }) {
   const [modeChoice, setMode] = useState<ViewMode | null>(null);
   const [narrow, setNarrow] = useState(() => window.matchMedia('(max-width: 650px)').matches);
   const [activeSide, setActiveSide] = useState<Side>('new');
@@ -30,10 +31,11 @@ export default function PdfComparisonViewer({ job, report, oldSource, newSource,
   const [pairIndex, setPairIndex] = useState(0);
   const [sourceCombination, setSourceCombination] = useState(false);
   const [manualPages, setManualPages] = useState<Record<Side, number | null> | null>(null);
-  const [loaded, setLoaded] = useState<Record<string, 'loaded' | 'failed'>>({});
-  const [attempt, setAttempt] = useState(0);
+  const [images, setImages] = useState<Record<string, ImageRequest>>({});
   const [space, setSpace] = useState({ width: 800, height: 600 });
   const viewport = useRef<HTMLDivElement>(null);
+  const detailPair = useRef<HTMLDivElement>(null);
+  const centeredCanvases = useRef(new WeakMap<HTMLElement, string>());
   const pagePairs = report?.page_pairs ?? [];
   const sources = { old: oldSource, new: newSource };
   const mode = modeChoice ?? (narrow ? 'switch' : 'side');
@@ -109,11 +111,53 @@ export default function PdfComparisonViewer({ job, report, oldSource, newSource,
     const right = Math.min(paperWidth, Math.max(box[2] * paperWidth + 12, left + 120));
     const bottom = Math.min(paperHeight, Math.max(box[3] * paperHeight + 12, top + 48));
     if (right <= left || bottom <= top) return null;
-    return { ...region, page: page.number, left, top, width: right - left, height: bottom - top, paperWidth, paperHeight };
+    // Text fragments guide the viewport. The original source still defines the highlight.
+    const textBoxes = source?.location_granularity === 'cell' && source.method === 'text' && !region.reference
+      ? (source.content_sources ?? []).flatMap(part => {
+          const fragment = part.bbox;
+          return part.kind === 'pdf' && part.page === page.number && part.method === 'text' && !part.manual &&
+            fragment?.length === 4 && fragment.every(Number.isFinite) &&
+            fragment[0] >= box[0] && fragment[1] >= box[1] && fragment[2] <= box[2] && fragment[3] <= box[3] &&
+            fragment[2] > fragment[0] && fragment[3] > fragment[1] ? [fragment] : [];
+        })
+      : [];
+    const focus = textBoxes.length ? [
+      Math.min(...textBoxes.map(fragment => fragment[0])),
+      Math.min(...textBoxes.map(fragment => fragment[1])),
+      Math.max(...textBoxes.map(fragment => fragment[2])),
+      Math.max(...textBoxes.map(fragment => fragment[3])),
+    ] : box;
+    return {
+      ...region, page: page.number, left, top, width: right - left, height: bottom - top, paperWidth, paperHeight,
+      focusX: (focus[0] + focus[2]) * paperWidth / 2 - left,
+      focusY: (focus[1] + focus[3]) * paperHeight / 2 - top,
+    };
   });
   const hasDetails = !!selectionId && detailBoxes.some(Boolean);
   const localView = hasDetails && !showOriginal;
+  const detailSide = detailBoxes[sides.indexOf(activeSide)] ? activeSide : sides.find((_, index) => detailBoxes[index]) ?? activeSide;
+  const [oldDetailState, newDetailState] = detailBoxes.map((detail, index) => detail && images[imageUrl(sides[index], detail.page, true)]?.status);
   const viewingOtherPages = sides.some(side => sources[side]?.page && sources[side]?.page !== pageNumbers[side]);
+
+  useLayoutEffect(() => {
+    const canvases = detailPair.current?.querySelectorAll<HTMLElement>('.pdf-detail-scroll');
+    if (!canvases?.length) return;
+    function center(canvas: HTMLElement) {
+      const { focusX, focusY } = canvas.dataset;
+      if (!focusX || !focusY) {
+        centeredCanvases.current.delete(canvas);
+        canvas.scrollTo(0, 0);
+        return;
+      }
+      const position = `${focusX}:${focusY}:${canvas.clientWidth}:${canvas.clientHeight}`;
+      if (centeredCanvases.current.get(canvas) === position) return;
+      centeredCanvases.current.set(canvas, position);
+      canvas.scrollTo(Number(focusX) - canvas.clientWidth / 2, Number(focusY) - canvas.clientHeight / 2);
+    }
+    const resize = new ResizeObserver(entries => entries.forEach(entry => center(entry.target as HTMLElement)));
+    canvases.forEach(canvas => { center(canvas); resize.observe(canvas); });
+    return () => resize.disconnect();
+  }, [localView, narrow, detailSide, selectionId, detailScale, oldDetailState, newDetailState]);
 
   useEffect(() => {
     const target = viewport.current;
@@ -140,22 +184,71 @@ export default function PdfComparisonViewer({ job, report, oldSource, newSource,
   }
 
   function imageUrl(side: Side, page: number, hd: boolean) {
-    return `/api/jobs/${job.id}/pages/${side}/${page}.png?attempt=${attempt}${hd ? '&dpi=288' : ''}`;
+    return `/api/jobs/${job.id}/pages/${side}/${page}.png?dpi=${hd ? 288 : 144}`;
   }
 
   function pageImage(url: string, alt: string, failure: string, style?: React.CSSProperties) {
-    return loaded[url] === 'failed' ? <div className="paper-image-error" role="alert">{failure}<button onClick={event => {
-      event.currentTarget.closest<HTMLElement>('[tabindex="0"]')?.focus({ preventScroll: true });
-      setAttempt(value => value + 1);
-    }}>重试图像</button></div> : <>
-      <img key={url} src={url} alt={alt} draggable={false} style={style}
-        onLoad={() => setLoaded(state => ({ ...state, [url]: 'loaded' }))}
-        onError={() => setLoaded(state => ({ ...state, [url]: 'failed' }))} />
-      {!loaded[url] && <span className="paper-loading" role="status">正在读取图像…</span>}
+    const attempt = images[url]?.attempt ?? 0;
+    const status = images[url]?.status ?? 'loading';
+    const retrying = attempt > 0 && status === 'loading';
+    function finish(next: 'loaded' | 'failed') {
+      setImages(state => {
+        const current = state[url];
+        if ((current?.attempt ?? 0) !== attempt || current?.status === next) return state;
+        return { ...state, [url]: { attempt, status: next } };
+      });
+    }
+    return <>
+      {status !== 'failed' && <img key={`${url}&attempt=${attempt}`} src={`${url}&attempt=${attempt}`} alt={alt} draggable={false}
+        style={retrying ? { ...style, visibility: 'hidden' } : style}
+        onLoad={event => {
+          const retry = event.currentTarget.parentElement?.querySelector('.paper-image-error button');
+          if (retry && retry === document.activeElement) {
+            retry.closest<HTMLElement>('[tabindex="0"]')?.focus({ preventScroll: true });
+          }
+          finish('loaded');
+        }}
+        onError={() => finish('failed')} />}
+      {(status === 'failed' || retrying) && <div className="paper-image-error">
+        {retrying ? <span role="status">正在重试图像…</span> : <span role="alert">{failure}</span>}
+        <button type="button" aria-label={`重试图像：${alt}`} aria-disabled={retrying} onClick={() => {
+          setImages(state => state[url]?.status === 'failed'
+            ? { ...state, [url]: { attempt: state[url].attempt + 1, status: 'loading' } }
+            : state);
+        }}>重试图像</button>
+      </div>}
+      {status === 'loading' && !retrying && <span className="paper-loading" role="status">正在读取图像…</span>}
     </>;
   }
 
+  const distinctObjects = [...new Set([report?.old?.object, report?.new?.object].filter(Boolean))];
+  const object = distinctObjects.length === 1 ? distinctObjects[0] : report?.object;
+  const unit = /(?:^| \/ )单位工程名称[：:]([^]*?)(?= \/ |$)/.exec(object ?? '')?.[1];
+  const shortObject = unit?.trim() || object?.replace(/^(工程名称|单项工程名称)[：:]/, '');
+  const objectNeedsDisclosure = !!unit || distinctObjects.length > 1 || (shortObject?.length ?? 0) > 28;
+  const scope = [
+    objectNeedsDisclosure && !unit ? null : shortObject,
+    report?.type_code || report?.title,
+    record?.category === 'completeness' ? '完整性' : record?.category ? categoryLabels[record.category] : null,
+    record?.row_key,
+  ].filter(Boolean);
+  const scopePages = sides.flatMap((side, index) => {
+    const page = localView ? detailBoxes[index]?.page : pageNumbers[side];
+    const singleSide = localView ? narrow ? detailSide : null : mode === 'switch' ? visibleSide : null;
+    return page && (!singleSide || singleSide === side) ? [`${sideLabels[side]}第 ${page} 页`] : [];
+  });
+
   return <section className="full-page-viewer" aria-label="完整报表原页比较">
+    {(scope.length > 0 || scopePages.length > 0 || activeFilter) && <div className="original-scope">
+      {scope.length > 0 && <p className="original-scope-identity">{scope.join(' · ')}</p>}
+      {scopePages.length > 0 && <p>{scopePages.join(' / ')}</p>}
+      {objectNeedsDisclosure && <details className="original-scope-project">
+        <summary>工程全称</summary>
+        {distinctObjects.length > 1 ? sides.map(side => report?.[side]?.object &&
+          <p key={side}>{sideLabels[side]} {report[side]?.object}</p>) : <p>{object}</p>}
+      </details>}
+      {activeFilter && <p>当前筛选 · {activeFilter}</p>}
+    </div>}
     <div className="original-toolbar">
       <div className="evidence-views" role="group" aria-label="原文视图">
         <button aria-pressed={localView} aria-disabled={!hasDetails} onClick={() => { if (hasDetails) setShowOriginal(false); }}>高清局部</button>
@@ -168,19 +261,26 @@ export default function PdfComparisonViewer({ job, report, oldSource, newSource,
     {selectionId && <div className="source-addresses small">{sides.map(side => <span className={`source-side ${side}`} key={side}><strong>{sideLabels[side]}</strong> {sourceLabel(sources[side], true)}</span>)}</div>}
     {selectionId && !hasDetails && <p className="small muted crop-unavailable">本条记录没有高清局部，可查看完整原页。</p>}
     {localView && <div className="pdf-detail-comparison">
-      <div className="pdf-detail-pair">{sides.map((side, index) => {
+      {narrow && <div className="evidence-views detail-side-switch" role="group" aria-label="切换高清局部版本">
+        {sides.map((side, index) => <button key={side} disabled={!detailBoxes[index]} aria-pressed={side === detailSide} onClick={() => setActiveSide(side)}>显示{sideLabels[side]}</button>)}
+      </div>}
+      <div className="pdf-detail-pair" ref={detailPair}>{sides.map((side, index) => {
+        if (narrow && side !== detailSide) return null;
         const detail = detailBoxes[index];
         const label = sideLabels[side];
         const url = detail ? imageUrl(side, detail.page, true) : null;
+        const ready = !!url && images[url]?.status === 'loaded';
         return <section className={`pdf-detail-side ${side}`} key={side} aria-label={`${label}差异局部`}>
           <h4>{label}{detail ? ` · 第 ${detail.page} 页${detail.reference ? ' · 参考区域' : ''}` : ''}</h4>
-          {detail && url ? <div key={selectionId} className="pdf-detail-scroll" tabIndex={0} aria-label={`${label}差异局部滚动画布`}>
+          {detail && url ? <div key={selectionId} className="pdf-detail-scroll" tabIndex={0} aria-label={`${label}差异局部滚动画布`}
+            data-focus-x={ready ? detail.focusX * detailScale : undefined}
+            data-focus-y={ready ? detail.focusY * detailScale : undefined}>
             <div className="pdf-detail-crop" style={{ width: detail.width * detailScale, height: detail.height * detailScale }}>
               {pageImage(url, `${label}第 ${detail.page} 页所选差异原图局部`, '局部原图加载失败', {
                 width: detail.paperWidth * detailScale, height: detail.paperHeight * detailScale,
                 left: -detail.left * detailScale, top: -detail.top * detailScale,
               })}
-              {loaded[url] === 'loaded' && detail.boxes.map((box, index) => <div key={index} className={`pdf-detail-outline ${detail.reference ? 'reference-region' : ''}`} style={{
+              {ready && detail.boxes.map((box, index) => <div key={index} className={`pdf-detail-outline ${detail.reference ? 'reference-region' : ''}`} style={{
                 left: (box[0] * detail.paperWidth - detail.left) * detailScale,
                 top: (box[1] * detail.paperHeight - detail.top) * detailScale,
                 width: (box[2] - box[0]) * detail.paperWidth * detailScale,
@@ -241,10 +341,12 @@ export default function PdfComparisonViewer({ job, report, oldSource, newSource,
             if (!page || (mode === 'switch' && visibleSide !== side)) return null;
             const region = regionOf(sources[side], page.number);
             const url = imageUrl(side, page.number, zoom > 100);
+            const overlayOpacity = mode === 'overlay' && side === 'new' ? opacity / 100 : undefined;
             return <div key={side} className={`physical-paper ${side}`} data-side={side} data-physical-width={width(side)} data-physical-height={height(side)}
-              style={{ width: width(side) * scale, height: height(side) * scale, left: mode === 'side' && side === 'new' ? oldWidth * scale + gap : 0, top: 0, opacity: mode === 'overlay' && side === 'new' ? opacity / 100 : 1 }}>
-              {!localView && pageImage(url, `${sideLabels[side]}完整原文件第 ${page.number} 页`, `${sideLabels[side]}原页加载失败`)}
-              {loaded[url] === 'loaded' && region?.boxes.map((box, index) => <div key={index} className={`full-page-highlight ${region.reference ? 'reference-region' : ''}`} style={{
+              style={{ width: width(side) * scale, height: height(side) * scale, left: mode === 'side' && side === 'new' ? oldWidth * scale + gap : 0, top: 0, background: overlayOpacity === undefined ? undefined : 'transparent' }}>
+              {!localView && pageImage(url, `${sideLabels[side]}完整原文件第 ${page.number} 页`, `${sideLabels[side]}原页加载失败`, { opacity: overlayOpacity })}
+              {images[url]?.status === 'loaded' && region?.boxes.map((box, index) => <div key={index} className={`full-page-highlight ${region.reference ? 'reference-region' : ''}`} style={{
+                opacity: overlayOpacity,
                 left: `${box[0] * 100}%`, top: `${box[1] * 100}%`, width: `${(box[2] - box[0]) * 100}%`, height: `${(box[3] - box[1]) * 100}%`,
               }} />)}
             </div>;

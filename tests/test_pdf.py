@@ -250,7 +250,7 @@ def test_userunit_and_cropbox_preserve_normalized_cell_geometry(tmp_path, monkey
         assert image.crop(box).convert("L").getextrema()[0] < 100
 
 
-def test_hundred_a4_pages_read_and_compare_and_101_pages_rejected(tmp_path):
+def test_hundred_a4_pages_read_and_compare_and_101_pages_use_page_assets(tmp_path):
     from reportlab.lib.pagesizes import A4
     from backend.models import CompareConfig
 
@@ -282,6 +282,9 @@ def test_hundred_a4_pages_read_and_compare_and_101_pages_rejected(tmp_path):
     for _ in range(101):
         writer.showPage()
     writer.save()
-    with pytest.raises(ValueError, match='1 至 100 页'):
-        extract_pdf(too_long, tmp_path / 'rejected-images')
-    assert not list((tmp_path / 'rejected-images').iterdir())
+    complete = extract_pdf(too_long, tmp_path / 'large-assets')
+    assert len(complete['pages']) == 101
+    assert complete['asset_storage'] == 'page_files_v1'
+    assert not list((tmp_path / 'large-assets').glob('page-*.png'))
+    assert len(list((tmp_path / 'large-assets').glob('appearance-*.json.gz'))) == 101
+    assert all('appearance' not in page and page['render_deferred'] for page in complete['pages'])

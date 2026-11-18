@@ -9,7 +9,7 @@ from difflib import SequenceMatcher
 
 from openpyxl.utils import get_column_letter, range_boundaries
 
-_CODE = re.compile(r"(?:表\s*)?([ABC]\s*[.．]\s*\d+(?:\s*[.．]\s*\d+)*)\s*(.*)", re.I)
+_CODE = re.compile(r"(?:表\s*)?([A-I]\s*[.．]\s*\d+(?:\s*[.．]\s*\d+)*)\s*(.*)", re.I)
 _OBJECT = re.compile(r"(单项工程名称|单位工程名称|工程名称)\s*[:：]")
 _BAD = re.compile(r"\(cid:\d+\)|�")
 
@@ -85,13 +85,30 @@ def _titles(lines):
 
 def _identity(title, context):
     values, slots, evidence = {}, set(), []
-    for line in context:
+    for line_index, line in enumerate(context):
         text = _clean(line["text"])
         matches = list(_OBJECT.finditer(text))
         for index, match in enumerate(matches):
             key = match.group(1)
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-            value = re.split(r"第.{0,8}页|共.{0,8}页|编制人|编制日期|日期[:：]|单位[:：]", text[match.end():end])[0]
+            value = re.split(r"标段[:：]?|第.{0,8}页|共.{0,8}页|编制人|编制日期|日期[:：]|单位[:：]", text[match.end():end])[0]
+            if title and title.get("type_code") in {"D.1", "D.2", "D.3", "E.1", "E.2"} and index == len(matches) - 1:
+                bounds = line.get("bbox", [0, 0, 1, 1])
+                last_bottom = bounds[3]
+                for following in context[line_index + 1:]:
+                    box = following.get("bbox", [0, 0, 1, 1])
+                    suffix = _clean(following["text"])
+                    if re.fullmatch(r"(?:第\d+页)?(?:共\d+页)?", suffix):
+                        continue
+                    if abs(box[0] - bounds[0]) > .03 or box[1] - last_bottom > .025:
+                        break
+                    if _OBJECT.search(suffix) or re.match(r"^(?:序号|其中|暂估价|金额|项目编码|测评|说明|标段|[A-I]\.)", suffix):
+                        break
+                    suffix = re.split(r"标段[:：]?|第\d+页|共\d+页", suffix)[0]
+                    if suffix:
+                        value += suffix
+                        evidence.append(following)
+                        last_bottom = box[3]
             value = value.strip("_—-:： ")
             slots.add(key)
             if value:
@@ -583,7 +600,11 @@ def _title_reliable(report, book):
 
 def _family(report):
     if report.get("type_code"):
-        return ("code", report["type_code"])
+        code = report["type_code"]
+        if code in {"D.1", "D.2", "D.3"}:
+            kind = "bid" if "投标报价" in report.get("title", "") else "limit" if "最高投标限价" in report.get("title", "") else ""
+            return ("code", code, kind)
+        return ("code", code)
     if _type(report):
         return ("title", _clean(report["title"]), report.get("chapter", ""))
     return None
@@ -615,6 +636,62 @@ def _titles_v2(lines, sheets):
                 and not in_table and (bounds[1] < .3 or followed_by_object) and not any(t.get("bbox") == bounds for t in titles)):
             titles.append({**line, "type_code": None, "title": text})
     return sorted(titles, key=lambda title: title.get("bbox", [0, 0, 0, 0])[1])
+
+
+def _cost_engineering_context(book):
+    """Attach parent identity from D.1/D.2 rows without changing page evidence."""
+    from .cost_reports import _extract
+
+    reports = book["reports"]
+    parents, parent_sources, projects = defaultdict(set), {}, {}
+    for report in reports:
+        code = report.get("type_code")
+        if code not in {"D.1", "D.2"}:
+            continue
+        rows, _, issues = _extract(book, report, code)
+        if issues:
+            continue
+        name = _object_fields(report).get("工程名称", "")
+        for row in rows:
+            if not re.fullmatch(r"\d+", _clean(row["values"].get("sequence", ""))):
+                continue
+            child = _clean(row["values"].get("name", ""))
+            if code == "D.1":
+                projects[child] = name
+            elif name and child:
+                parents[child].add(name)
+                parent_sources[(name, child)] = row["sources"].get("name")
+
+    active_parent, pending = "", set()
+    for report in reports:
+        code = report.get("type_code")
+        fields = _object_fields(report)
+        name = fields.get("工程名称", "")
+        if code == "D.1":
+            active_parent, pending = "", set()
+            report["cost_identity"] = {"project": name}
+        elif code == "D.2":
+            pending.add(name)
+            report["cost_identity"] = {"project": projects.get(name, ""), "single_project": name}
+            fields["单项工程名称"] = name
+        elif code in {"D.3", "E.1", "E.2"}:
+            if pending:
+                active_parent = next(iter(pending)) if len(pending) == 1 else ""
+                pending.clear()
+            candidates = parents.get(name, set())
+            parent = next(iter(candidates)) if len(candidates) == 1 else active_parent if active_parent in candidates else ""
+            if len(candidates) == 1:
+                active_parent = parent
+            elif not candidates:
+                active_parent = ""
+            report["cost_identity"] = {"project": projects.get(parent, ""), "single_project": parent, "unit": name}
+            fields["单位工程名称"] = name
+            if parent:
+                fields["单项工程名称"] = parent
+                report["cost_identity_sources"] = [parent_sources[(parent, name)]]
+            elif candidates:
+                report["cost_identity_issue"] = "单位工程名称对应多个单项工程，父级归属尚未确认"
+            report["object"] = " / ".join(f"{key}：{fields[key]}" for key in ("单项工程名称", "单位工程名称") if fields.get(key))
 
 
 def _attach_report_inventory_v2(book):
@@ -659,6 +736,8 @@ def _attach_report_inventory_v2(book):
         report["issues"] = [message for message in report["issues"] if not any(
             text in message for text in ("工程对象", "未提取到可比较的多列表格", "源页仅含", "多个独立实例"))]
         report.pop("duplicate", None)
+
+    _cost_engineering_context(result)
 
     merged = []
     for report in result["reports"]:

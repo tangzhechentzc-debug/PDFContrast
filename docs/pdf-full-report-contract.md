@@ -55,7 +55,7 @@
 
 ## 段落有效行距与左／中／右对齐
 
-新运行的 `reports[].paragraph_checks` 按实际段落与属性记录 `changed / unchanged / unverified`，包含两侧原页区域、描述和 `measurements`。属性为 `line_spacing` 或 `alignment`。历史运行没有这些字段时显示“本次未记录”，不补写新结论。导出新增「段落测量证据」工作表，保存相同运行快照的测量值、位置和依据。
+运行快照中的 `reports[].paragraph_checks` 按实际段落与属性记录 `changed / unchanged / unverified`，包含两侧原页区域、描述和 `measurements`。属性为 `line_spacing` 或 `alignment`。公开的创建、读取与历史列表接口只返回 `paragraph_check_summary`（`total / changed / unchanged / unverified`），避免整册测量明细阻塞结果页面。展开检查后调用 `GET /api/runs/{id}/paragraph-checks?report_id=...&offset=0&limit=100`，响应为 `items / total / offset / limit`；每页最多100条，保留判定、说明和两侧来源，不传原始 `measurements`。分页不修改内部完整快照，导出「段落测量证据」仍保存当次运行的测量值、位置和依据。历史运行没有检查记录时显示“本次未记录”，不补写新结论；前端兼容旧接口内联的检查记录。
 
 - 行距由原生字形矩阵的基线坐标乘以 UserUnit 后计算相邻距离，单位 pt；整块平移不会改变距离。
 - 页面尺寸、字号和内容缩放同时变化时，仍报告可测的实际距离变化；这些伴随变化保存在测量上下文中，不将结果说成编辑器的固定值或倍数设置变化。

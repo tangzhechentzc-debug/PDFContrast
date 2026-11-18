@@ -1,16 +1,22 @@
 import { useState } from 'react';
-import { dimensionLabels, dimensionStatusLabels } from '../api';
-import type { ComparisonDimension, ReportComparison, ResultLocation, Run, Side, Source } from '../types';
+import { businessStatusLabels, dimensionLabels, dimensionStatusLabels } from '../api';
+import type { ComparisonCategory, ComparisonDimension, ReportComparison, ResultLocation, Run, Side, Source } from '../types';
 
 const presenceLabels = { shared: '对应报表', old_only: '仅旧版', new_only: '仅新版', uncertain: '对应关系待确认' };
 const regionLabels = { blank_page: '空白页', document_section: '文档正文', continuation_note: '续页说明 / 注释', unclassified_region: '未归类区域' };
 
-export default function PdfFullReportOverview({ run, busy, onOpen, onLocate, onConfigure }: { run: Run; busy: boolean; onOpen: (id: string, category?: ComparisonDimension) => void; onLocate: (location: ResultLocation) => void; onConfigure: () => void }) {
+function unverifiedParagraphs(report: ReportComparison) {
+  return report.paragraph_check_summary?.unverified ?? report.paragraph_checks?.filter(check => check.status === 'unverified').length ?? 0;
+}
+
+export default function PdfFullReportOverview({ run, busy, onOpen, onLocate, onConfigure }: { run: Run; busy: boolean; onOpen: (id: string, category?: ComparisonCategory) => void; onLocate: (location: ResultLocation) => void; onConfigure: () => void }) {
   const [query, setQuery] = useState('');
   const reports = run.reports ?? [];
   const shown = reports.filter(report => [report.title, report.type_code, report.old?.object, report.new?.object].join(' ').toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
   const changed = reports.filter(report => report.comparison_status === 'changed' || report.change_count > 0 || Object.values(report.dimensions ?? {}).some(dimension => dimension.changes > 0 || dimension.status === 'changed')).length;
-  const pending = reports.filter(report => report.confirmation === 'pending' || Object.values(report.dimensions ?? {}).some(dimension => ['partial', 'unverified'].includes(dimension.status))).length;
+  const pending = reports.filter(report => report.confirmation === 'pending' || report.business?.status === 'pending' || Object.values(report.dimensions ?? {}).some(dimension => ['partial', 'unverified'].includes(dimension.status))).length;
+  const unverifiedByReport = new Map(reports.map(report => [report.id, unverifiedParagraphs(report)]));
+  const reportsWithUnverifiedParagraphs = [...unverifiedByReport.values()].filter(count => count > 0).length;
   function locate(report: ReportComparison, side: Side, page: number) {
     const pair = report.page_pairs?.find(item => item[`${side}_page`] === page);
     const source = (target: Side): Source | null => {
@@ -21,7 +27,7 @@ export default function PdfFullReportOverview({ run, busy, onOpen, onLocate, onC
     onLocate({ id: `${report.id}:${side}:${page}`, report_id: report.id, title: report.title, message: pair?.basis ?? '此页尚无明确的对侧对应页，仅定位已知原页。', old_source: source('old'), new_source: source('new') });
   }
   return <section className="full-report-overview" aria-label="完整报表四维概览">
-    <div className="result-counts"><span>存在确定变化 <strong>{changed} 张</strong></span><span>待确认或部分可比 <strong>{pending} 张</strong></span></div>
+    <div className="result-counts"><span>存在确定变化 <strong>{changed} 张</strong></span><span>待确认或部分可比 <strong>{pending} 张</strong></span>{reportsWithUnverifiedParagraphs > 0 && <span>有段落属性未验证 <strong>{reportsWithUnverifiedParagraphs} 张</strong></span>}</div>
     <div className="overview-actions">
       <label className="report-search">查找报表、类型或工程名<input aria-label="查找完整报表" type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="例如表号或报表标题" /></label>
       <button disabled={busy} onClick={onConfigure}>调整报表对应关系</button>
@@ -32,16 +38,23 @@ export default function PdfFullReportOverview({ run, busy, onOpen, onLocate, onC
         <div className="directory-identity">
           <button onClick={() => onOpen(report.id)}>{report.type_code ? `${report.type_code} · ` : ''}{report.title}</button>
           <span className={`chip ${report.confirmation === 'pending' ? 'warn' : ''}`}>{presenceLabels[report.presence]}</span>
+          {!!unverifiedByReport.get(report.id) && <small className="warning-text">段落属性 {unverifiedByReport.get(report.id)} 项未验证</small>}
           {(['old', 'new'] as const).map(side => <small key={side}>{side === 'old' ? '旧版' : '新版'} {report[side] ? report[side]?.object || (report[side]?.object_status === 'template' ? '模板' : '对象未填写') : '暂无对应'}</small>)}
         </div>
         <div className="directory-dimensions">
           {(Object.keys(dimensionLabels) as ComparisonDimension[]).map(category => {
             const result = report.dimensions?.[category];
-            return <button key={category} onClick={() => onOpen(report.id, category)} aria-label={`${report.title} ${dimensionLabels[category]}摘要`}>
-              <strong>{dimensionLabels[category]}</strong> <span>{result ? dimensionStatusLabels[result.status] : '尚未计算'}</span>
-              <small>{result ? `${result.changes} 项变化 · ${result.issues} 项待核对` : '无当次结果'}</small>
+            const unverified = category === 'format' ? unverifiedByReport.get(report.id) : 0;
+            const verification = unverified ? `段落属性 ${unverified} 项未验证` : '';
+            return <button key={category} onClick={() => onOpen(report.id, category)} aria-label={`${report.title} ${dimensionLabels[category]}摘要${verification ? ` · ${verification}` : ''}`}>
+              <strong>{dimensionLabels[category]}</strong> <span>{unverified && result?.status === 'unchanged' ? '已比较部分未发现变化' : result ? dimensionStatusLabels[result.status] : '尚未计算'}</span>
+              <small>{result ? `${result.changes} 项差异事件 · ${result.issues} 项待核对事件` : '无当次结果'}</small>
             </button>;
           })}
+          {report.business && <button onClick={() => onOpen(report.id, 'business')} aria-label={`${report.title} 业务数据摘要`}>
+            <strong>业务数据</strong> <span>{businessStatusLabels[report.business.status]}</span>
+            <small>已比较 {report.business.compared_rows} 行 · {report.business.compared_fields} 个字段</small>
+          </button>}
         </div>
         <details className="directory-basis">
           <summary>原页、配对与验证范围</summary>

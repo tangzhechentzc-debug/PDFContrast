@@ -147,7 +147,42 @@ def _frames(strokes, width, height):
     return [b for i, b in enumerate(frames) if not any(i != j and o[0] <= b[0] + .0001 and o[1] <= b[1] + .0001 and o[2] >= b[2] - .0001 and o[3] >= b[3] - .0001 and (o[2] - o[0]) * (o[3] - o[1]) > (b[2] - b[0]) * (b[3] - b[1]) + .0001 for j, o in enumerate(frames))]
 
 
-def extract_page_appearance(page, page_image) -> dict:
+def _extract_page_tables(page) -> list[dict]:
+    """每页仅调用一次原生表格识别与文本提取，保留原始 PDF 坐标及单元格合并跨度。"""
+    extracted_tables = []
+    for table in page.find_tables():
+        rows = [list(row.cells) for row in table.rows]
+        boxes = [b for row in rows for b in row if b is not None]
+        xs = sorted({round(v, 4) for b in boxes for v in (b[0], b[2])})
+        ys = sorted({round(v, 4) for b in boxes for v in (b[1], b[3])})
+        spans = []
+        for r, row in enumerate(rows, 1):
+            for c, b in enumerate(row, 1):
+                if b is None:
+                    continue
+                c1, c2 = xs.index(round(b[0], 4)) + 1, xs.index(round(b[2], 4))
+                r1, r2 = ys.index(round(b[1], 4)) + 1, ys.index(round(b[3], 4))
+                spans.append({
+                    'row': r,
+                    'column': c,
+                    'bbox': b,
+                    'row_start': r1,
+                    'row_end': r2,
+                    'column_start': c1,
+                    'column_end': c2,
+                })
+        extracted_tables.append({
+            'bbox': table.bbox,
+            'rows': rows,
+            'row_count': len(rows),
+            'column_count': max((len(row) for row in rows), default=0),
+            'extracted': table.extract(),
+            'spans': spans,
+        })
+    return extracted_tables
+
+
+def extract_page_appearance(page, page_image, *, tables=None) -> dict:
     unit = float(resolve1(page.page_obj.attrs.get('UserUnit', 1)))
     width, height = float(page.width) * unit, float(page.height) * unit
     origin_x, origin_y = page.bbox[:2]
@@ -204,33 +239,49 @@ def extract_page_appearance(page, page_image) -> dict:
                             'stroke': _color(item.get('stroking_color')) or [0, 0, 0], 'fill': (_color(item.get('non_stroking_color')) or [0, 0, 0]) if item.get('fill') else None,
                             'stroke_enabled': item.get('stroke', True)})
     strokes = _strokes(vectors, width, height)
-    tables, cells = [], []
-    for index, table in enumerate(page.find_tables()):
-        boxes = [b for row in table.rows for b in row.cells if b]
-        xs = sorted({round(v, 4) for b in boxes for v in (b[0], b[2])})
-        ys = sorted({round(v, 4) for b in boxes for v in (b[1], b[3])})
+    # 仅在未传入预提取表格时才提取，避免传入空列表 [] 时被误判重新调用 find_tables()
+    if tables is None:
+        tables = _extract_page_tables(page)
+    rendered_tables, cells = [], []
+    for index, table in enumerate(tables):
         table_cells, merged = [], set()
-        for r, row in enumerate(table.rows, 1):
-            for c, b in enumerate(row.cells, 1):
-                if b is None:
-                    continue
-                c1, c2 = xs.index(round(b[0], 4)) + 1, xs.index(round(b[2], 4))
-                r1, r2 = ys.index(round(b[1], 4)) + 1, ys.index(round(b[3], 4))
-                record = {'table_index': index, 'row': r, 'column': c, 'row_span': r2 - r1 + 1, 'column_span': c2 - c1 + 1,
-                          'bbox': [(b[0] - origin_x) / page.width, (b[1] - origin_y) / page.height, (b[2] - origin_x) / page.width, (b[3] - origin_y) / page.height]}
-                if record['row_span'] > 1 or record['column_span'] > 1:
-                    record['merged_range'] = f'{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}'
-                    merged.add(record['merged_range'])
-                table_cells.append(record)
-        tables.append({'bbox': [(table.bbox[0] - origin_x) / page.width, (table.bbox[1] - origin_y) / page.height,
-                                (table.bbox[2] - origin_x) / page.width, (table.bbox[3] - origin_y) / page.height],
-                       'rows': len(table.rows), 'columns': max((len(row.cells) for row in table.rows), default=0),
-                       'cells': table_cells, 'merged_ranges': sorted(merged), 'text': table.extract()})
+        for span in table['spans']:
+            b = span['bbox']
+            c1, c2 = span['column_start'], span['column_end']
+            r1, r2 = span['row_start'], span['row_end']
+            record = {
+                'table_index': index,
+                'row': span['row'],
+                'column': span['column'],
+                'row_span': r2 - r1 + 1,
+                'column_span': c2 - c1 + 1,
+                'bbox': [
+                    (b[0] - origin_x) / page.width,
+                    (b[1] - origin_y) / page.height,
+                    (b[2] - origin_x) / page.width,
+                    (b[3] - origin_y) / page.height,
+                ],
+            }
+            if record['row_span'] > 1 or record['column_span'] > 1:
+                record['merged_range'] = f'{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}'
+                merged.add(record['merged_range'])
+            table_cells.append(record)
+        tb = table['bbox']
+        rendered_tables.append({
+            'bbox': [
+                (tb[0] - origin_x) / page.width,
+                (tb[1] - origin_y) / page.height,
+                (tb[2] - origin_x) / page.width,
+                (tb[3] - origin_y) / page.height,
+            ],
+            'rows': table['row_count'],
+            'columns': table['column_count'],
+            'cells': table_cells,
+            'merged_ranges': sorted(merged),
+            'text': table['extracted'],
+        })
         cells.extend(table_cells)
     rgb = page_image.original.convert('RGB').resize((max(1, round(width * VISUAL_DPI / 72)), max(1, round(height * VISUAL_DPI / 72))), Image.Resampling.LANCZOS)
-    render = rgb.convert('L')
-    buffer = io.BytesIO()
-    render.save(buffer, format='PNG')
     color_buffer = io.BytesIO()
     rgb.save(color_buffer, format='PNG')
     images = [{'bbox': box(item), 'source_size': list(item.get('srcsize', ())), 'bits': item.get('bits')} for item in page.images]
@@ -244,11 +295,11 @@ def extract_page_appearance(page, page_image) -> dict:
     return {'version': 1, 'page_number': page.page_number, 'width_pt': width, 'height_pt': height, 'user_unit': unit,
             'rotation': int(page.rotation), 'media_box': list(page.mediabox), 'crop_box': list(page.cropbox),
             'chars': chars, 'runs': runs, 'lines': [{'text': line['text'], 'bbox': line['bbox'], 'char_ids': [c['id'] for c in line['chars']]} for line in lines],
-            'vectors': vectors, 'strokes': strokes, 'frames': _frames(strokes, width, height), 'tables': tables, 'cells': cells, 'images': images,
+            'vectors': vectors, 'strokes': strokes, 'frames': _frames(strokes, width, height), 'tables': rendered_tables, 'cells': cells, 'images': images,
             'raster_dominant': image_area > .15 and len(chars) < 12 or image_area > .8 and not page.lines and not page.rects,
             'unsupported_objects': unsupported,
-            'render': {'dpi': VISUAL_DPI, 'width': render.width, 'height': render.height,
-                       'gray_png_base64': base64.b64encode(buffer.getvalue()).decode(), 'rgb_png_base64': base64.b64encode(color_buffer.getvalue()).decode(),
+            'render': {'dpi': VISUAL_DPI, 'width': rgb.width, 'height': rgb.height,
+                       'rgb_png_base64': base64.b64encode(color_buffer.getvalue()).decode(),
                        'sha256': hashlib.sha256(color_buffer.getvalue()).hexdigest()},
             'limitations': ['字体指 PDF 有效字体资源和字号，不代表原编辑器的字体设置或加粗开关。',
                             '字距、基线距、换行与对齐仅描述实际几何；不反推段落样式。',
@@ -293,7 +344,22 @@ def _text_source(view, atoms):
     return source
 
 
-def _page_views(book, report):
+def index_page_overlays(book):
+    overlays = defaultdict(list)
+    for sheet in book.get('sheets', []):
+        if sheet.get('member_sheets'):
+            continue
+        for cell in sheet.get('cells', {}).values():
+            src = cell.get('pdf_source', {})
+            page = src.get('page')
+            if page is None or (sheet.get('structure') == 'text_blocks' and cell.get('row') == 1):
+                continue
+            if src.get('method') == 'ocr' or cell.get('correction_revision') is not None or cell.get('manual'):
+                overlays[page].append((sheet, cell))
+    return overlays
+
+
+def _page_views(book, report, overlays_by_page):
     result, unavailable = [], []
     explicit = report.get('comparison_regions')
     for number in report.get('pages', []):
@@ -316,33 +382,25 @@ def _page_views(book, report):
         chars = [copy.deepcopy(c) for c in appearance['chars'] if any(_inside(c['bbox'], region) for region in scopes)]
         overlays = []
         seen = set()
-        for sheet in book.get('sheets', []):
-            if sheet.get('member_sheets'):
+        for sheet, cell in overlays_by_page.get(number, ()):
+            src = cell['pdf_source']
+            if not any(_inside(src.get('bbox', [0, 0, 1, 1]), region) for region in scopes):
                 continue
-            for cell in sheet.get('cells', {}).values():
-                src = cell.get('pdf_source', {})
-                if src.get('page') != number or not any(_inside(src.get('bbox', [0, 0, 1, 1]), region) for region in scopes):
-                    continue
-                if sheet.get('structure') == 'text_blocks' and cell.get('row') == 1:
-                    continue
-                revised = cell.get('correction_revision') is not None or cell.get('manual')
-                ocr = src.get('method') == 'ocr'
-                if not revised and not ocr:
-                    continue
-                identity = cell.get('review_id') or (sheet['name'], cell['address'])
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                text = cell.get('current_text', cell.get('display', ''))
-                manual = bool(cell.get('manual') and src.get('location_precision', src.get('precision')) == 'page')
-                if not manual:
-                    chars = [c for c in chars if not _inside(c['bbox'], src['bbox'])]
-                reliable = bool(cell.get('reviewed') and page.get('reviewed'))
-                virtual = [{'id': f'review-{identity}-{i}', 'order': i, 'text': ch, 'bbox': src['bbox'], 'font': None, 'size_pt': None,
-                            'color': None, 'bold': None, 'method': src.get('method', 'ocr'), 'reliable': reliable, 'review_id': cell.get('review_id'),
-                            'manual': manual, 'corrected': revised, 'bad_unicode': bool(_BAD.search(text))} for i, ch in enumerate(text)]
-                if virtual:
-                    overlays.append({'text': text, 'bbox': src['bbox'], 'chars': virtual, 'manual': manual})
+            revised = cell.get('correction_revision') is not None or cell.get('manual')
+            identity = cell.get('review_id') or (sheet['name'], cell['address'])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            text = cell.get('current_text', cell.get('display', ''))
+            manual = bool(cell.get('manual') and src.get('location_precision', src.get('precision')) == 'page')
+            if not manual:
+                chars = [c for c in chars if not _inside(c['bbox'], src['bbox'])]
+            reliable = bool(cell.get('reviewed') and page.get('reviewed'))
+            virtual = [{'id': f'review-{identity}-{i}', 'order': i, 'text': ch, 'bbox': src['bbox'], 'font': None, 'size_pt': None,
+                        'color': None, 'bold': None, 'method': src.get('method', 'ocr'), 'reliable': reliable, 'review_id': cell.get('review_id'),
+                        'manual': manual, 'corrected': revised, 'bad_unicode': bool(_BAD.search(text))} for i, ch in enumerate(text)]
+            if virtual:
+                overlays.append({'text': text, 'bbox': src['bbox'], 'chars': virtual, 'manual': manual})
         lines = _lines(chars) + overlays
         lines.sort(key=lambda line: (bool(line.get('manual')), line['bbox'][1], line['bbox'][0]))
         selected = lambda records: [item for item in records if any(_inside(item['bbox'], scope) for scope in scopes)]
@@ -571,13 +629,19 @@ def _content_fragments(view, exclusions):
 
 def _complete_cell_edges(fragments, opposite):
     consumed=set()
+    references=defaultdict(list)
+    free_text=defaultdict(list)
+    for reference in opposite:
+        if reference['cell']:
+            references[(reference['column'],reference['cell']['column'],reference['cell']['row'])].append(reference)
+    for fragment in fragments:
+        if not fragment['cell']:
+            free_text[(fragment['view']['number'],fragment['key'])].append(fragment)
     for fragment in fragments:
         if not fragment['cell'] or len(fragment['key'])<2:
             continue
         candidates=[]
-        for reference in opposite:
-            if not reference['cell'] or fragment['column']!=reference['column'] or fragment['cell']['column']!=reference['cell']['column'] or fragment['cell']['row']!=reference['cell']['row']:
-                continue
+        for reference in references[(fragment['column'],fragment['cell']['column'],fragment['cell']['row'])]:
             if reference['key'].count(fragment['key'])!=1 or reference['key']==fragment['key']:
                 continue
             prefix,suffix=reference['key'].split(fragment['key'])
@@ -587,7 +651,7 @@ def _complete_cell_edges(fragments, opposite):
             for value in (prefix,suffix):
                 if not value:
                     parts.append(None);continue
-                nearby=[f for f in fragments if not f['cell'] and id(f) not in consumed and f['view']['number']==fragment['view']['number'] and f['key']==value and
+                nearby=[f for f in free_text[(fragment['view']['number'],value)] if id(f) not in consumed and
                         box[0]-.005 <= f['bbox'][0] and f['bbox'][2] <= box[2]+.005 and box[1]-.025 <= f['bbox'][1] <= box[3]+.025]
                 if len(nearby)!=1:break
                 parts.append(nearby[0])
@@ -653,6 +717,28 @@ def _content_pairs(left, right, page_links):
     mapping, reverse, bases = {}, {}, {}
     row_links=set()
     context_links=set()
+    by_page,by_key,by_label,by_context,by_slot,by_row={},{},{},{},{},{}
+    for side,fragments in (('old',left),('new',right)):
+        by_page[side],by_key[side],by_label[side]=defaultdict(list),defaultdict(list),defaultdict(list)
+        by_context[side],by_slot[side],by_row[side]=defaultdict(list),defaultdict(list),defaultdict(list)
+        for index,fragment in enumerate(fragments):
+            by_page[side][fragment['view']['number']].append(index)
+            by_key[side][fragment['key']].append(index)
+            by_label[side][(fragment['key'],fragment['column'])].append(index)
+            if fragment['context']:
+                by_context[side][fragment['context']].append(index)
+            if fragment['column'] and fragment['row_key']:
+                by_slot[side][(fragment['column'],fragment['row_key'])].append(index)
+            if fragment['cell']:
+                cell=fragment['cell']
+                by_row[side][(fragment['view']['number'],cell['table_index'],cell['row'],fragment['column'])].append(index)
+    linked_pages={'old':defaultdict(set),'new':defaultdict(set)}
+    for old_page,new_page in page_links:
+        linked_pages['old'][new_page].add(old_page)
+        linked_pages['new'][old_page].add(new_page)
+    linked_indices={side:{page:sorted(index for target in targets for index in by_page[side][target])
+                         for page,targets in links.items()} for side,links in linked_pages.items()}
+    linked_rows={'old':defaultdict(set),'new':defaultdict(set)}
     def row_link(a,b):
         return (a['view']['number'],a['cell']['table_index'],a['cell']['row'],b['view']['number'],b['cell']['table_index'],b['cell']['row']) if a['cell'] and b['cell'] else None
     def compatible(a,b,ignore_row=False):
@@ -685,43 +771,80 @@ def _content_pairs(left, right, page_links):
     for i,a in enumerate(left):
         if not a['cell'] or not a['column'] or re.fullmatch(r'[\d.,()+−—-]+',a['key']) or len(a['key'])<2:
             continue
-        candidates=[j for j,b in enumerate(right) if j not in reverse and b['cell'] and a['key']==b['key'] and a['column']==b['column'] and
+        candidates=[j for j in by_label['new'][(a['key'],a['column'])] if j not in reverse and (b:=right[j])['cell'] and
                     (a['view']['number'],b['view']['number']) in page_links and compatible(a,b,ignore_row=True)]
         if len(candidates)==1:
             j=candidates[0]
-            peers=[k for k,other in enumerate(left) if k not in mapping and other['cell'] and other['key']==right[j]['key'] and other['column']==right[j]['column'] and
+            peers=[k for k in by_label['old'][(right[j]['key'],right[j]['column'])] if k not in mapping and (other:=left[k])['cell'] and
                    (other['view']['number'],right[j]['view']['number']) in page_links and compatible(other,right[j],ignore_row=True)]
             if len(peers)==1:
                 bind(i,j,'已确认原页对内，同列唯一非数字名称作为行锚点')
-                row_links.add(row_link(a,right[j]))
+                link=row_link(a,right[j])
+                row_links.add(link)
+                linked_rows['new'][link[:3]].add(link[3:])
+                linked_rows['old'][link[3:]].add(link[:3])
+    # Identical text in the identical source region of a confirmed page pair
+    # is direct visual evidence, even when merged headers repeat a column name.
+    # Keep row/context compatibility so this cannot override a known row move.
+    exact_regions={'old':defaultdict(list),'new':defaultdict(list)}
+    def region_key(fragment,page=None):
+        return (fragment['view']['number'] if page is None else page,fragment['key'],
+                tuple(round(v,9) for v in fragment['bbox']),bool(fragment['cell']))
+    for side,fragments in (('old',left),('new',right)):
+        for index,fragment in enumerate(fragments):
+            exact_regions[side][region_key(fragment)].append(index)
+    for i,a in enumerate(left):
+        if i in mapping:
+            continue
+        candidates=[j for page in linked_pages['new'].get(a['view']['number'],())
+                    for j in exact_regions['new'].get(region_key(a,page),())
+                    if j not in reverse and compatible(a,right[j])]
+        if len(candidates)!=1:
+            continue
+        j=candidates[0]
+        peers=[k for page in linked_pages['old'].get(right[j]['view']['number'],())
+               for k in exact_regions['old'].get(region_key(right[j],page),())
+               if k not in mapping and compatible(left[k],right[j])]
+        if len(peers)==1:
+            bind(i,j,'已确认页对内，文字与原文区域双向唯一且完全一致')
     # Confirmed page correspondence disambiguates repeated headers before a
     # report-wide search for content that genuinely moved to another page.
     for i,a in enumerate(left):
         if i in mapping:
             continue
-        candidates=[j for j,b in enumerate(right) if j not in reverse and (a['view']['number'],b['view']['number']) in page_links and
-                    compatible(a,b) and (slot(a,b) or a['key']==b['key'])]
+        candidates=[j for j in linked_indices['new'].get(a['view']['number'],[]) if j not in reverse and
+                    compatible(a,b:=right[j]) and (slot(a,b) or a['key']==b['key'])]
         if len(candidates)==1:
             j=candidates[0]
-            peers=[k for k,other in enumerate(left) if k not in mapping and (other['view']['number'],right[j]['view']['number']) in page_links and
-                   compatible(other,right[j]) and (slot(other,right[j]) or other['key']==right[j]['key'])]
+            peers=[k for k in linked_indices['old'].get(right[j]['view']['number'],[]) if k not in mapping and
+                   compatible(other:=left[k],right[j]) and (slot(other,right[j]) or other['key']==right[j]['key'])]
             if len(peers)==1:
                 bind(i,j,'已确认原页对内的行列标签或唯一完整片段文本')
+    def slot_indices(fragment,side):
+        candidates=set(by_context[side].get(fragment['context'],[])) if fragment['context'] else set()
+        if fragment['column'] and fragment['row_key']:
+            candidates.update(by_slot[side].get((fragment['column'],fragment['row_key']),[]))
+        if fragment['cell'] and fragment['column']:
+            cell=fragment['cell']
+            identity=(fragment['view']['number'],cell['table_index'],cell['row'])
+            for target in linked_rows[side].get(identity,()):
+                candidates.update(by_row[side].get((*target,fragment['column']),[]))
+        return sorted(candidates)
     # Named row/column evidence precedes string equality, so swapping two
     # amounts under fixed row labels remains two value changes.
     for i,a in enumerate(left):
         if i in mapping:
             continue
-        candidates=[j for j,b in enumerate(right) if j not in reverse and slot(a,b)]
+        candidates=[j for j in slot_indices(a,'new') if j not in reverse and slot(a,right[j])]
         if len(candidates)==1:
             j=candidates[0]
-            if sum(slot(other,right[j]) for k,other in enumerate(left) if k not in mapping)==1:
+            if sum(slot(left[k],right[j]) for k in slot_indices(right[j],'old') if k not in mapping)==1:
                 bind(i,j,'相同列标题与行键，或相同同行字段标签')
     for i,a in enumerate(left):
         if i in mapping:
             continue
-        candidates=[j for j,b in enumerate(right) if j not in reverse and a['key']==b['key'] and compatible(a,b)]
-        peers=[k for k,other in enumerate(left) if k not in mapping and other['key']==a['key']]
+        candidates=[j for j in by_key['new'][a['key']] if j not in reverse and compatible(a,right[j])]
+        peers=[k for k in by_key['old'][a['key']] if k not in mapping]
         if len(candidates)==len(peers)==1:
             bind(i,candidates[0],'双向唯一的完整片段文本，且行列上下文不冲突')
     # Repeated signature/field labels are bounded by already matched nearby
@@ -736,7 +859,7 @@ def _content_pairs(left, right, page_links):
         upper=min(following,key=lambda pair:left[pair[0]]['bbox'][1]) if following else None
         if not lower or not upper or right[lower[1]]['view'] is not right[upper[1]]['view']:
             continue
-        candidates=[j for j,b in enumerate(right) if j not in reverse and not b['cell'] and b['view'] is right[lower[1]]['view'] and a['key']==b['key'] and compatible(a,b) and
+        candidates=[j for j in by_key['new'][a['key']] if j not in reverse and not (b:=right[j])['cell'] and b['view'] is right[lower[1]]['view'] and compatible(a,b) and
                     right[lower[1]]['bbox'][1]-.003 <= b['bbox'][1] <= right[upper[1]]['bbox'][1]+.003]
         if len(candidates)==1:
             bind(i,candidates[0],'已配对的前后字段共同限定同一段内的唯一重复标签')
@@ -745,7 +868,7 @@ def _content_pairs(left, right, page_links):
     for i,a in enumerate(left):
         if i in mapping:
             continue
-        candidates=[j for j,b in enumerate(right) if j not in reverse and compatible(a,b) and a['key']==b['key'] and
+        candidates=[j for j in by_key['new'][a['key']] if j not in reverse and compatible(a,b:=right[j]) and
                     ((a['column'] and a['column']==b['column']) or (not a['cell'] and abs(a['bbox'][0]-b['bbox'][0])<.03))]
         if candidates:
             distances=sorted((abs(a['bbox'][1]-right[j]['bbox'][1]),j) for j in candidates)
@@ -769,30 +892,44 @@ def _content_pairs(left, right, page_links):
                 return .8
             return 0
         return SequenceMatcher(None,x,y,autojunk=False).ratio() if min(len(x),len(y))>=3 else 0
-    scores={(i,j):score(a,b) for i,a in enumerate(left) if i not in mapping for j,b in enumerate(right) if j not in reverse}
+    scores={}
+    scores_by_left=defaultdict(list)
+    scores_by_right=defaultdict(list)
+    for i,a in enumerate(left):
+        if i in mapping:
+            continue
+        for j,b in enumerate(right):
+            if j in reverse:
+                continue
+            value=score(a,b)
+            if value > 0:
+                scores[(i,j)]=value
+                scores_by_left[i].append((j,value))
+                scores_by_right[j].append((i,value))
     for (i,j),value in sorted(scores.items(),key=lambda p:p[1],reverse=True):
         if value < .62 or i in mapping or j in reverse:
             continue
-        alternatives=[v for (ii,jj),v in scores.items() if (ii==i and jj!=j and jj not in reverse) or (jj==j and ii!=i and ii not in mapping)]
+        alternatives=[v for jj,v in scores_by_left[i] if jj!=j and jj not in reverse]
+        alternatives.extend(v for ii,v in scores_by_right[j] if ii!=i and ii not in mapping)
         if value-max(alternatives,default=0) >= .12:
             bind(i,j,f'双向唯一片段相似度 {value:.3f}，且行列上下文不冲突')
     for i,a in enumerate(left):
         if i in mapping:
             continue
-        candidates=[j for j,b in enumerate(right) if j not in reverse and a['key']==b['key'] and compatible(a,b) and
+        candidates=[j for j in by_key['new'][a['key']] if j not in reverse and compatible(a,b:=right[j]) and
                     (a['view']['number'],b['view']['number']) in page_links]
         if len(candidates)==1:
             j=candidates[0]
-            if sum(other['key']==right[j]['key'] and compatible(other,right[j]) for k,other in enumerate(left) if k not in mapping)==1:
+            if sum(compatible(left[k],right[j]) for k in by_key['old'][right[j]['key']] if k not in mapping)==1:
                 bind(i,j,'已确认原页与字段对应中的唯一相同文字')
     pairs=[(a,right[mapping[i]],False,bases[i]) for i,a in enumerate(left) if i in mapping]
     for i,a in enumerate(left):
         if i not in mapping:
-            ambiguous=any(value>=.45 and j not in reverse for (ii,j),value in scores.items() if ii==i)
+            ambiguous=any(value>=.45 and j not in reverse for j,value in scores_by_left[i])
             pairs.append((a,None,ambiguous,'未建立可靠文字对应'))
     for j,b in enumerate(right):
         if j not in reverse:
-            ambiguous=any(value>=.45 and i not in mapping for (i,jj),value in scores.items() if jj==j)
+            ambiguous=any(value>=.45 and i not in mapping for i,value in scores_by_right[j])
             pairs.append((None,b,ambiguous,'未建立可靠文字对应'))
     return pairs
 
@@ -805,10 +942,23 @@ def _content_changes(old_views, new_views, entry, page_links):
     _complete_cell_edges(fragments['new'],fragments['old'])
     _continue_title_fields(fragments['old'],fragments['new'])
     _continue_title_fields(fragments['new'],fragments['old'])
+    reliability={}
+    for side,views in (('old',old_views),('new',new_views)):
+        failed={id(view):_failed_regions(view) for view in views}
+        bad_pages=any(view['metadata'].get('status') == 'unavailable' or
+                      view['appearance']['chars'] and sum(c.get('bad_unicode',False) for c in view['appearance']['chars']) > len(view['appearance']['chars'])/2
+                      for view in views)
+        bad_fragments=[candidate for candidate in fragments[side] if _anchor_warnings(candidate) or
+                       any(not atom['char'].get('reliable',True) or atom['char'].get('bad_unicode') for atom in candidate['atoms']) or
+                       any(_intersects(candidate['bbox'],box) for box in failed.get(id(candidate['view']),_failed_regions(candidate['view'])))]
+        reliability[side]=(bad_pages,[(view,failed[id(view)]) for view in views if failed[id(view)]],bad_fragments)
     def unreliable_opposite(fragment, side, views):
         band=lambda box: 0 if box[1]<.35 else 2 if box[1]>.75 else 1
-        for view in views:
-            for region in _failed_regions(view):
+        bad_pages,failed_views,bad_fragments=reliability[side]
+        if bad_pages:
+            return True
+        for view,regions in failed_views:
+            for region in regions:
                 if not fragment['cell'] and band(region)==band(fragment['bbox']):
                     return True
                 if fragment['cell']:
@@ -823,12 +973,8 @@ def _content_changes(old_views, new_views, entry, page_links):
                             return True
                     if view['appearance'].get('raster_dominant'):
                         return True
-            chars=view['appearance']['chars']
-            if view['metadata'].get('status') == 'unavailable' or chars and sum(c.get('bad_unicode',False) for c in chars) > len(chars)/2:
-                return True
-        for candidate in fragments[side]:
-            bad=bool(_anchor_warnings(candidate)) or any(not x['char'].get('reliable',True) or x['char'].get('bad_unicode') for x in candidate['atoms']) or any(_intersects(candidate['bbox'],box) for box in _failed_regions(candidate['view']))
-            if not bad or bool(candidate['cell']) != bool(fragment['cell']):
+        for candidate in bad_fragments:
+            if bool(candidate['cell']) != bool(fragment['cell']):
                 continue
             if fragment['cell']:
                 if candidate['column'] and fragment['column'] and candidate['column'] != fragment['column']:
@@ -1046,7 +1192,9 @@ def _border_correspondence(old, new, text_pairs):
 def _visual_regions(old, new, residual=False):
     def bitmap(view):
         render = view['appearance']['render']
-        image = Image.open(io.BytesIO(base64.b64decode(render.get('rgb_png_base64', render['gray_png_base64'])))).convert('RGB')
+        # 优先使用彩色渲染快照，惰性回退兼容仅含灰度图的旧版本历史快照
+        payload = render.get('rgb_png_base64') or render.get('gray_png_base64')
+        image = Image.open(io.BytesIO(base64.b64decode(payload))).convert('RGB')
         mask = Image.new('L', image.size, 255)
         draw = ImageDraw.Draw(mask)
         regions = view['scopes']
@@ -1094,26 +1242,13 @@ def _visual_regions(old, new, residual=False):
     return regions
 
 
-def compare_report_appearance(old_book, new_book, entry):
-    diffs = []
-    paragraph_checks = []
-    limits = {category: [] for category in _CATEGORIES}
-    unavailable_dimensions = set()
-    old, missing_old = _page_views(old_book, entry.get('old') or {})
-    new, missing_new = _page_views(new_book, entry.get('new') or {})
-    pairs = _pair_pages(old, new)
+def _filled_vectors(view):
+    """提取当前页比较范围内的带填充矢量对象。"""
+    return [x for x in view['appearance']['vectors'] if x['fill'] is not None and any(_inside(x['bbox'], r) for r in view['scopes'])]
 
-    def add(category, kind, field, before, after, message, a=None, b=None, old_source=None, new_source=None, issue=False, delta=None, measurements=None):
-        source_a = old_source or (_source(a) if a else None)
-        source_b = new_source or (_source(b) if b else None)
-        diffs.append({'id': f'appearance-{len(diffs) + 1:05d}', 'kind': kind, 'table_id': entry['id'], 'table_name': entry.get('title', '完整报表'),
-                      'row_key': f"旧第 {a['number']} 页 / 新第 {b['number']} 页" if a and b else '完整报表', 'field': field,
-                      'old_value': None if before is None else str(before), 'new_value': None if after is None else str(after), 'delta': delta,
-                      'message': message, 'severity': 'issue' if issue else 'change', 'old_source': source_a, 'new_source': source_b,
-                      'category': category, 'layer': 'uncertainty' if issue else category, 'report_id': entry['id']})
-        if measurements is not None:
-            diffs[-1]['measurements'] = measurements
 
+def _validate_report_pairing(old, new, missing_old, missing_new, entry, pairs, add, unavailable_dimensions) -> list:
+    """校验报表级快照完整性、人工确认状态、页数变化与页面顺序。"""
     if missing_old or missing_new:
         add('layout', 'appearance_unavailable', '完整报表范围', missing_old or None, missing_new or None,
             '页面缺少外观快照，或同页多报表未划定完整范围；不能把未比较视为一致。', issue=True)
@@ -1128,225 +1263,288 @@ def compare_report_appearance(old_book, new_book, entry):
     new_order = [new.index(b) for a, b in matched]
     if new_order != sorted(new_order):
         add('layout', 'page_order_changed', '报表页面顺序', [old.index(a) + 1 for a, b in matched], [new.index(b) + 1 for a, b in matched], '按唯一内容特征匹配到相同页面，其在报表内的顺序发生变化。', matched[0][0], matched[0][1])
-    for a, b, basis, state in pairs:
-        if state != 'confirmed':
-            add('layout', 'page_pairing_unverified', '页面对应关系', a['number'] if a else None, b['number'] if b else None, basis + '；没有按页数组位置强行对齐。', a, b, issue=True)
+    return pairs
+
+
+def _compare_page_pairing_and_canvas(a, b, basis, state, add, limits, unavailable_dimensions) -> bool | None:
+    """比较单页配对状态与画布物理属性；返回页面尺寸/方向是否变化，未配对或单侧页返回 None 以跳过后续阶段。"""
+    if state != 'confirmed':
+        add('layout', 'page_pairing_unverified', '页面对应关系', a['number'] if a else None, b['number'] if b else None, basis + '；没有按页数组位置强行对齐。', a, b, issue=True)
+        unavailable_dimensions.update(_CATEGORIES)
+        return None
+    if not a or not b:
+        add('structure', 'report_page_added' if b else 'report_page_removed', '报表页面', a['number'] if a else None, b['number'] if b else None, basis, a, b)
+        return None
+    ap, bp = a['appearance'], b['appearance']
+    crop = lambda p: [(p['crop_box'][i] - p['media_box'][i]) * (1 if i < 2 else -1) * p['user_unit'] for i in range(4)]
+    if any(abs(x - y) > .25 for x, y in zip(crop(ap), crop(bp))):
+        add('layout', 'page_crop_changed', '页面裁切边距', crop(ap), crop(bp), '比较裁切框相对于原始纸张四边的物理内缩量（pt）；纸张尺寸改变或原点平移不重复算作裁切变化。', a, b)
+    for view in (a, b):
+        if view['appearance'].get('unsupported_objects'):
             unavailable_dimensions.update(_CATEGORIES)
+            for category in _CATEGORIES:
+                limits[category].append('本页实际含注释、Widget 或可选内容层；其交互状态/隐藏内容未完整解析，不能据可见原生对象判定完全一致。')
+        for category in ('format', 'structure'):
+            limits[category].extend(view['appearance'].get('limitations', []))
+    orientation_a, orientation_b = ('横向' if ap['width_pt'] > ap['height_pt'] else '纵向'), ('横向' if bp['width_pt'] > bp['height_pt'] else '纵向')
+    size_changed = abs(ap['width_pt'] - bp['width_pt']) > .5 or abs(ap['height_pt'] - bp['height_pt']) > .5
+    rotation_changed = ap['rotation'] != bp['rotation']
+    if size_changed or rotation_changed:
+        kind = 'page_orientation_changed' if orientation_a != orientation_b else 'page_rotation_changed' if rotation_changed else 'page_size_changed'
+        add('layout', kind, '页面物理尺寸与方向', f"{ap['width_pt']:.2f} × {ap['height_pt']:.2f} pt；{orientation_a}；Rotate={ap['rotation']}",
+            f"{bp['width_pt']:.2f} × {bp['height_pt']:.2f} pt；{orientation_b}；Rotate={bp['rotation']}",
+            '使用 PDF 物理尺寸及 UserUnit；未将两页任意拉伸至相同尺寸，后续位置变化按整块汇总。', a, b)
+    return size_changed or rotation_changed
+
+
+def _compare_page_text_and_paragraphs(a, b, entry, page_changed, add, limits, unavailable_dimensions, paragraph_checks) -> list:
+    """比较单页字符属性、空白换行、字距、位置偏移与段落几何属性，并返回 format_groups 供后续边框对应使用。"""
+    ap, bp = a['appearance'], b['appearance']
+    exclusions = {side: [r['bbox'] for r in entry.get('content_exclusions', {}).get(side, []) if r['page'] == view['number']] for side, view in (('old', a), ('new', b))}
+    aa, ba = _atoms(a, exclusions['old']), _atoms(b, exclusions['new'])
+    if _failed_regions(a) or _failed_regions(b) or any(x['char'].get('bad_unicode') or not x['char'].get('reliable', True) for x in aa + ba):
+        add('content', 'text_extraction_unverified', '文字可靠性', None, None, '范围内含乱码或未完成核验的 OCR/校正文字，不能将当前字符串相同视为内容已验证。', a, b, issue=True)
+    if a['revised'] or b['revised']:
+        limits['format'].append('人工校正仅覆盖内容比较；字体及矢量格式仍描述原 PDF，不将新文字伪装成原件排版。')
+    native_a = {**a, 'lines': a['original_lines']}
+    native_b = {**b, 'lines': b['original_lines']}
+    fa, fb = _content_fragments(native_a, []), _content_fragments(native_b, [])
+    _complete_cell_edges(fa, fb)
+    _complete_cell_edges(fb, fa)
+    _continue_title_fields(fa, fb)
+    _continue_title_fields(fb, fa)
+    format_groups = []
+    unverified_groups = []
+    for left, right, ambiguous, basis in _content_pairs(fa, fb, {(a['number'], b['number'])}):
+        if not left or not right:
             continue
-        if not a or not b:
-            add('structure', 'report_page_added' if b else 'report_page_removed', '报表页面', a['number'] if a else None, b['number'] if b else None, basis, a, b)
+        atoms = left['atoms'] + right['atoms']
+        if ambiguous or _anchor_warnings(left) or _anchor_warnings(right) or any(not x['char'].get('reliable', True) or x['char'].get('bad_unicode') for x in atoms):
+            unverified_groups.append((left, right))
             continue
-        ap, bp = a['appearance'], b['appearance']
-        crop = lambda p: [(p['crop_box'][i] - p['media_box'][i]) * (1 if i < 2 else -1) * p['user_unit'] for i in range(4)]
-        if any(abs(x-y) > .25 for x,y in zip(crop(ap),crop(bp))):
-            add('layout','page_crop_changed','页面裁切边距',crop(ap),crop(bp),'比较裁切框相对于原始纸张四边的物理内缩量（pt）；纸张尺寸改变或原点平移不重复算作裁切变化。',a,b)
-        for view in (a,b):
-            if view['appearance'].get('unsupported_objects'):
-                unavailable_dimensions.update(_CATEGORIES)
-                for category in _CATEGORIES:
-                    limits[category].append('本页实际含注释、Widget 或可选内容层；其交互状态/隐藏内容未完整解析，不能据可见原生对象判定完全一致。')
-            for category in ('format','structure'):
-                limits[category].extend(view['appearance'].get('limitations', []))
-        orientation_a, orientation_b = ('横向' if ap['width_pt'] > ap['height_pt'] else '纵向'), ('横向' if bp['width_pt'] > bp['height_pt'] else '纵向')
-        size_changed = abs(ap['width_pt'] - bp['width_pt']) > .5 or abs(ap['height_pt'] - bp['height_pt']) > .5
-        rotation_changed = ap['rotation'] != bp['rotation']
-        if size_changed or rotation_changed:
-            kind = 'page_orientation_changed' if orientation_a != orientation_b else 'page_rotation_changed' if rotation_changed else 'page_size_changed'
-            add('layout', kind, '页面物理尺寸与方向', f"{ap['width_pt']:.2f} × {ap['height_pt']:.2f} pt；{orientation_a}；Rotate={ap['rotation']}",
-                f"{bp['width_pt']:.2f} × {bp['height_pt']:.2f} pt；{orientation_b}；Rotate={bp['rotation']}",
-                '使用 PDF 物理尺寸及 UserUnit；未将两页任意拉伸至相同尺寸，后续位置变化按整块汇总。', a, b)
-        exclusions = {side: [r['bbox'] for r in entry.get('content_exclusions', {}).get(side, []) if r['page'] == view['number']] for side, view in (('old', a), ('new', b))}
-        aa, ba = _atoms(a, exclusions['old']), _atoms(b, exclusions['new'])
-        if _failed_regions(a) or _failed_regions(b) or any(x['char'].get('bad_unicode') or not x['char'].get('reliable', True) for x in aa + ba):
-            add('content', 'text_extraction_unverified', '文字可靠性', None, None, '范围内含乱码或未完成核验的 OCR/校正文字，不能将当前字符串相同视为内容已验证。', a, b, issue=True)
-        if a['revised'] or b['revised']:
-            limits['format'].append('人工校正仅覆盖内容比较；字体及矢量格式仍描述原 PDF，不将新文字伪装成原件排版。')
-        native_a={**a,'lines':a['original_lines']};native_b={**b,'lines':b['original_lines']}
-        fa,fb=_content_fragments(native_a,[]),_content_fragments(native_b,[])
-        _complete_cell_edges(fa,fb);_complete_cell_edges(fb,fa)
-        _continue_title_fields(fa,fb);_continue_title_fields(fb,fa)
-        format_groups=[];unverified_groups=[]
-        for left,right,ambiguous,basis in _content_pairs(fa,fb,{(a['number'],b['number'])}):
-            if not left or not right:
+        la = [x for x in left['atoms'] if x['text'].strip()]
+        ra = [x for x in right['atoms'] if x['text'].strip()]
+        blocks = SequenceMatcher(None, [x['text'] for x in la], [x['text'] for x in ra], autojunk=False).get_matching_blocks()
+        glyphs = [(la[i + k], ra[j + k]) for i, j, n in blocks for k in range(n)]
+        format_groups.append((left, right, glyphs, basis))
+    linked = [pair for _, _, glyphs, _ in format_groups for pair in glyphs]
+    if unverified_groups:
+        left, right = unverified_groups[0]
+        add('format', 'attribute_unverified', '字符格式对应待核验', None, None,
+            f'{len(unverified_groups)} 个文字片段的原生文字或行列锚点不可靠，未对其字体、空白、换行及字距作确定判断。', a, b,
+            _text_source(a, left['atoms']), _text_source(b, right['atoms']), issue=True)
+    rotated = [(x, y) for x, y in linked if abs((x['char'].get('angle', 0) - y['char'].get('angle', 0) + 180) % 360 - 180) > .5]
+    if rotated:
+        add('layout', 'content_rotation_changed', '文字内容旋转', sorted({x['char'].get('angle', 0) for x, y in rotated}), sorted({y['char'].get('angle', 0) for x, y in rotated}), '由原生字符基线矩阵判断内容旋转，与纸张横竖及 Rotate 分开。', a, b, _text_source(a, [rotated[0][0]]), _text_source(b, [rotated[0][1]]))
+    if any(c.get('size_pt') is None for v in (a, b) for line in v['original_lines'] for c in line['chars']):
+        unavailable_dimensions.add('format')
+        limits['format'].append('旋转字形包围框高度不能可靠反推字号，相关字号不作确定判断。')
+    for attr, kind, label in (('font', 'font_changed', 'PDF 字体资源'), ('size_pt', 'font_size_changed', 'PDF 有效字号'), ('color', 'text_color_changed', '文字颜色'), ('bold', 'font_weight_changed', '可确认字体粗细')):
+        changed = [(x, y) for x, y in linked if x['char'].get(attr) is not None and y['char'].get(attr) is not None and
+                   (abs(x['char'][attr] - y['char'][attr]) > .15 if attr == 'size_pt' else x['char'][attr] != y['char'][attr])]
+        if changed:
+            examples = list(dict.fromkeys((str(x['char'][attr]), str(y['char'][attr])) for x, y in changed))
+            first = max(changed, key=lambda pair: pair[0]['char'].get('size_pt') or 0)
+            add('format', kind, label, '；'.join(v[0] for v in examples[:8]), '；'.join(v[1] for v in examples[:8]),
+                f'相同可匹配文字中有 {len(changed)} 个字符的{label}证据变化；已去除字体随机子集前缀，不推断编辑器设置。', a, b,
+                _text_source(a, [first[0]]), _text_source(b, [first[1]]))
+    moves, gaps = [], []
+    for left, right, glyphs, basis in format_groups:
+        evidence = {'match_basis': basis, 'old': {'fragment_text': left['text'], 'cell': left['cell'], 'text_bbox': left['bbox'], 'row_key': left['row_key'], 'column_label': left['column']},
+                    'new': {'fragment_text': right['text'], 'cell': right['cell'], 'text_bbox': right['bbox'], 'row_key': right['row_key'], 'column_label': right['column']}}
+        compact = lambda value: re.sub(r'\s+', '', value)
+        if compact(left['text']) == compact(right['text']):
+            if re.findall(r'\s+', left['text']) != re.findall(r'\s+', right['text']):
+                add('format', 'text_whitespace_changed', '原文空白与换行', left['text'], right['text'],
+                    '同一可靠单元格或段落的非空白文字相同，仅空格或换行改变；范围不跨相邻字段。', a, b,
+                    _text_source(a, left['atoms']), _text_source(b, right['atoms']), measurements=evidence)
+            old_lines = {x['line'] for x in left['atoms'] if x['text'].strip()}
+            new_lines = {x['line'] for x in right['atoms'] if x['text'].strip()}
+            if len(old_lines) != len(new_lines):
+                add('format', 'line_break_changed', '同文换行', len(old_lines), len(new_lines),
+                    '同一可靠单元格或段落的相同文字跨越的物理行数改变，不包含邻列或相邻字段。', a, b,
+                    _text_source(a, left['atoms']), _text_source(b, right['atoms']), measurements=evidence)
+        if len(glyphs) < 3:
+            continue
+        old_box, new_box = _union(x['char']['bbox'] for x, y in glyphs), _union(y['char']['bbox'] for x, y in glyphs)
+        if max(abs(old_box[0] - new_box[0]), abs(old_box[1] - new_box[1])) > .008:
+            moves.append((_text_source(a, [x for x, y in glyphs]), _text_source(b, [y for x, y in glyphs]), evidence))
+        line_pairs = defaultdict(list)
+        for x, y in glyphs:
+            line_pairs[(x['line'], y['line'])].append((x, y))
+        for items in line_pairs.values():
+            if len(items) < 3:
                 continue
-            atoms=left['atoms']+right['atoms']
-            if ambiguous or _anchor_warnings(left) or _anchor_warnings(right) or any(not x['char'].get('reliable',True) or x['char'].get('bad_unicode') for x in atoms):
-                unverified_groups.append((left,right));continue
-            la=[x for x in left['atoms'] if x['text'].strip()];ra=[x for x in right['atoms'] if x['text'].strip()]
-            blocks=SequenceMatcher(None,[x['text'] for x in la],[x['text'] for x in ra],autojunk=False).get_matching_blocks()
-            glyphs=[(la[i+k],ra[j+k]) for i,j,n in blocks for k in range(n)]
-            format_groups.append((left,right,glyphs,basis))
-        linked=[pair for _,_,glyphs,_ in format_groups for pair in glyphs]
-        if unverified_groups:
-            left,right=unverified_groups[0]
-            add('format','attribute_unverified','字符格式对应待核验',None,None,
-                f'{len(unverified_groups)} 个文字片段的原生文字或行列锚点不可靠，未对其字体、空白、换行及字距作确定判断。',a,b,
-                _text_source(a,left['atoms']),_text_source(b,right['atoms']),issue=True)
-        rotated = [(x,y) for x,y in linked if abs((x['char'].get('angle',0)-y['char'].get('angle',0)+180)%360-180) > .5]
-        if rotated:
-            add('layout','content_rotation_changed','文字内容旋转',sorted({x['char'].get('angle',0) for x,y in rotated}),sorted({y['char'].get('angle',0) for x,y in rotated}),'由原生字符基线矩阵判断内容旋转，与纸张横竖及 Rotate 分开。',a,b,_text_source(a,[rotated[0][0]]),_text_source(b,[rotated[0][1]]))
-        if any(c.get('size_pt') is None for v in (a,b) for line in v['original_lines'] for c in line['chars']):
-            unavailable_dimensions.add('format')
-            limits['format'].append('旋转字形包围框高度不能可靠反推字号，相关字号不作确定判断。')
-        for attr, kind, label in (('font', 'font_changed', 'PDF 字体资源'), ('size_pt', 'font_size_changed', 'PDF 有效字号'), ('color', 'text_color_changed', '文字颜色'), ('bold', 'font_weight_changed', '可确认字体粗细')):
-            changed = [(x, y) for x, y in linked if x['char'].get(attr) is not None and y['char'].get(attr) is not None and
-                       (abs(x['char'][attr] - y['char'][attr]) > .15 if attr == 'size_pt' else x['char'][attr] != y['char'][attr])]
-            if changed:
-                examples = list(dict.fromkeys((str(x['char'][attr]), str(y['char'][attr])) for x, y in changed))
-                first = max(changed, key=lambda pair: pair[0]['char'].get('size_pt') or 0)
-                add('format', kind, label, '；'.join(v[0] for v in examples[:8]), '；'.join(v[1] for v in examples[:8]),
-                    f'相同可匹配文字中有 {len(changed)} 个字符的{label}证据变化；已去除字体随机子集前缀，不推断编辑器设置。', a, b,
-                    _text_source(a,[first[0]]),_text_source(b,[first[1]]))
-        moves, gaps = [], []
-        for left,right,glyphs,basis in format_groups:
-            evidence={'match_basis':basis,'old':{'fragment_text':left['text'],'cell':left['cell'],'text_bbox':left['bbox'],'row_key':left['row_key'],'column_label':left['column']},
-                      'new':{'fragment_text':right['text'],'cell':right['cell'],'text_bbox':right['bbox'],'row_key':right['row_key'],'column_label':right['column']}}
-            compact=lambda value: re.sub(r'\s+','',value)
-            if compact(left['text'])==compact(right['text']):
-                if re.findall(r'\s+',left['text'])!=re.findall(r'\s+',right['text']):
-                    add('format','text_whitespace_changed','原文空白与换行',left['text'],right['text'],
-                        '同一可靠单元格或段落的非空白文字相同，仅空格或换行改变；范围不跨相邻字段。',a,b,
-                        _text_source(a,left['atoms']),_text_source(b,right['atoms']),measurements=evidence)
-                old_lines={x['line'] for x in left['atoms'] if x['text'].strip()};new_lines={x['line'] for x in right['atoms'] if x['text'].strip()}
-                if len(old_lines)!=len(new_lines):
-                    add('format','line_break_changed','同文换行',len(old_lines),len(new_lines),
-                        '同一可靠单元格或段落的相同文字跨越的物理行数改变，不包含邻列或相邻字段。',a,b,
-                        _text_source(a,left['atoms']),_text_source(b,right['atoms']),measurements=evidence)
-            if len(glyphs)<3:
+            positions = []
+            for fragment, item in ((left, items[0][0]), (right, items[0][1])):
+                positions.append({char['id']: index for index, char in enumerate(fragment['view']['lines'][item['line']]['chars'])})
+            adjacent = [(p, q) for p, q in zip(items, items[1:]) if all(positions[side][q[side]['char']['id']] == positions[side][p[side]['char']['id']] + 1 for side in (0, 1))]
+            if len(adjacent) < 2:
                 continue
-            old_box,new_box=_union(x['char']['bbox'] for x,y in glyphs),_union(y['char']['bbox'] for x,y in glyphs)
-            if max(abs(old_box[0]-new_box[0]),abs(old_box[1]-new_box[1]))>.008:
-                moves.append((_text_source(a,[x for x,y in glyphs]),_text_source(b,[y for x,y in glyphs]),evidence))
-            line_pairs=defaultdict(list)
-            for x,y in glyphs:
-                line_pairs[(x['line'],y['line'])].append((x,y))
-            for items in line_pairs.values():
-                if len(items)<3:
-                    continue
-                positions=[]
-                for fragment,item in ((left,items[0][0]),(right,items[0][1])):
-                    positions.append({char['id']:index for index,char in enumerate(fragment['view']['lines'][item['line']]['chars'])})
-                adjacent=[(p,q) for p,q in zip(items,items[1:]) if all(positions[side][q[side]['char']['id']]==positions[side][p[side]['char']['id']]+1 for side in (0,1))]
-                if len(adjacent)<2:
-                    continue
-                def spacing(side,width):
-                    return median((q[side]['char']['bbox'][0]-p[side]['char']['bbox'][2])*width/max(p[side]['char'].get('size_pt') or 1,1) for p,q in adjacent)
-                xgap,ygap=spacing(0,ap['width_pt']),spacing(1,bp['width_pt'])
-                if abs(xgap-ygap)>.08:
-                    evidence={**evidence,'adjacent_gap_count':len(adjacent),'gap_pairs':[
-                        {side:{'text':[p[index]['text'],q[index]['text']],'char_ids':[p[index]['char']['id'],q[index]['char']['id']],
-                               'bboxes':[p[index]['char']['bbox'],q[index]['char']['bbox']],
-                               'gap_em':(q[index]['char']['bbox'][0]-p[index]['char']['bbox'][2])*width/max(p[index]['char'].get('size_pt') or 1,1)}
-                         for index,side,width in ((0,'old',ap['width_pt']),(1,'new',bp['width_pt']))} for p,q in adjacent]}
-                    runs=[]
-                    for p,q in adjacent:
-                        if runs and all(runs[-1][-1][side]['char']['id']==p[side]['char']['id'] for side in (0,1)):
-                            runs[-1].append(q)
-                        else:runs.append([p,q])
-                    sources=[]
-                    for side,view in ((0,a),(1,b)):
-                        source=_text_source(view,[item[side] for run in runs for item in run])
-                        parts=[_text_source(view,[item[side] for item in run]) for run in runs]
-                        boxes=[box for part in parts for box in part.get('highlight_boxes',[part['bbox']])]
-                        if len(boxes)>1:source.update(highlight_boxes=boxes,bbox=_union(boxes))
-                        sources.append(source)
-                    gaps.append((xgap,ygap,*sources,evidence))
-        if moves:
-            add('layout','text_layout_changed','文字块位置',f'{len(moves)} 个匹配文字区域',f'{len(moves)} 个匹配文字区域',
-                '只在已可靠对应的单元格或段落内测量文字位置；下方定位第一处测量样例。'+(' 页面尺寸/方向也变化。' if size_changed or rotation_changed else ''),a,b,
-                moves[0][0],moves[0][1],measurements=moves[0][2])
-        if gaps:
-            add('format','character_spacing_changed','实际字距',f'{gaps[0][0]:.3f} em',f'{gaps[0][1]:.3f} em',
-                f'{len(gaps)} 个可靠单元格或段落内的同行字距测量改变；仅比较两侧原始字符序列中均真实相邻的同一字符对，至少两条共同间隙。下方定位第一处测量样例。',a,b,
-                gaps[0][2],gaps[0][3],measurements=gaps[0][4])
-        page_checks = compare_paragraphs(a, b)
-        paragraph_checks.extend(page_checks)
-        uncertain_paragraphs = []
-        for check in page_checks:
-            if check['status'] == 'changed':
-                attr = check['attribute']
-                add('format', 'paragraph_line_spacing_changed' if attr == 'line_spacing' else 'paragraph_alignment_changed',
-                    '有效段落行距（基线）' if attr == 'line_spacing' else '段落几何对齐', check['old_value'], check['new_value'],
-                    check['message'], a, b, check['old_source'], check['new_source'], measurements=check['measurements'])
-            elif check['status'] == 'unverified':
-                measurements = check['measurements']
-                left, right = measurements.get('old'), measurements.get('new')
-                field = 'baseline_gaps_pt' if check['attribute'] == 'line_spacing' else 'line_edges_pt'
-                if left and right and field in left and field in right and left[field] != right[field]:
-                    uncertain_paragraphs.append(check)
-                elif left is None or right is None:
-                    uncertain_paragraphs.append(check)
-                elif measurements.get('native_baselines_unavailable') or '文字提取或 OCR' in check['message'] or '缺少可比较' in check['message']:
-                    uncertain_paragraphs.append(check)
-        if uncertain_paragraphs:
-            check = uncertain_paragraphs[0]
-            add('format', 'paragraph_measurement_unverified', '段落属性待核验', check['old_value'], check['new_value'],
-                f'{len(uncertain_paragraphs)} 项段落属性不能确定；详情见逐段检查。' + check['message'], a, b,
-                check['old_source'], check['new_source'], issue=True, measurements=check['measurements'])
-        topology = lambda v: sorted((t['rows'], t['columns'], tuple(t['merged_ranges'])) for t in v['tables'])
-        if topology(a) != topology(b):
-            add('structure', 'table_structure_changed', '表格行列与合并结构', topology(a), topology(b), '比较矢量网格恢复的行数、列数和合并范围，包含空白行与空白表单；不依赖业务数值。', a, b)
-        def form_shape(view):
-            free = _free_lines(view)
-            return (len(view['frames']), len(free), len(view['images']))
-        if form_shape(a) != form_shape(b):
-            add('structure', 'form_structure_changed', '空框、填写线及图像结构', form_shape(a), form_shape(b), '依次为闭合外框、框外填写横线、图像数量；已合并相接共线段，不以 PDF 绘图对象数量冒充可见结构数量。', a, b)
-        frame_changes = []
-        for x, y in _geometry_pairs([{'bbox': f} for f in a['frames']], [{'bbox': f} for f in b['frames']]):
-            fa, fb = x['bbox'], y['bbox']
-            before = [round((fa[2]-fa[0])*ap['width_pt'], 2), round((fa[3]-fa[1])*ap['height_pt'], 2)]
-            after = [round((fb[2]-fb[0])*bp['width_pt'], 2), round((fb[3]-fb[1])*bp['height_pt'], 2)]
-            if max(abs(u-v) for u,v in zip(before,after)) > .5 or max(abs(u-v) for u,v in zip(fa,fb)) > .008:
-                frame_changes.append((fa, fb, before, after))
-        if frame_changes:
-            fa, fb, before, after = frame_changes[0]
-            add('layout', 'form_geometry_changed', '空框尺寸与位置', f'{before[0]} × {before[1]} pt', f'{after[0]} × {after[1]} pt', f'{len(frame_changes)} 个对应闭合表单框的中心线宽高或页边位置变化；宽高取左右纵线、上下横线的中心轴距离，线宽及端点伸缩另计。', a, b, _source(a,[fa]), _source(b,[fb]),measurements={'geometry_basis':'闭合框四边中心轴距离','old_bbox':fa,'new_bbox':fb,'old_size_pt':before,'new_size_pt':after})
-        border_pairs,unresolved_borders=_border_correspondence(a,b,format_groups)
-        for x,y,evidence in border_pairs:
-            if evidence['boundary_role'] not in ('before_label','after_label','isolated_line') or x['orientation']!='horizontal':continue
-            if any(abs(u-v)>.001 for u,v in zip(x['bbox'],y['bbox'])) or _geometry_text(x,ap)!=_geometry_text(y,bp):
-                add('layout','filling_line_geometry_changed','填写线长度与位置',_geometry_text(x,ap),_geometry_text(y,bp),'填写线按可靠相同字段或唯一孤立线锚比较物理长度与位置，不按全页最近坐标建立对应。',a,b,_source(a,[x['bbox']]),_source(b,[y['bbox']]),measurements=evidence)
-        signature=lambda styles:sorted(_style_text([style]) for style in styles)
-        changed_styles=[(x,y,evidence) for x,y,evidence in border_pairs if signature(x['styles'])!=signature(y['styles'])]
-        if changed_styles:
-            x,y,evidence=changed_styles[0]
-            confirmed=[{**basis,'old':{'bbox':p['bbox'],'styles':p['styles']},'new':{'bbox':q['bbox'],'styles':q['styles']},'style_changed':signature(p['styles'])!=signature(q['styles'])} for p,q,basis in border_pairs]
-            add('format','border_style_changed','矢量线宽、线型与颜色',_style_text(x['styles']),_style_text(y['styles']),f'{len(changed_styles)} 个具有可靠边界对应的局部线段样式改变；下方数值与定位仅展示第一处样例，全部已确认对应保留在测量证据中。',a,b,_source(a,[x['bbox']]),_source(b,[y['bbox']]),measurements={**evidence,'confirmed_changed_segments':len(changed_styles),'confirmed_pairs':confirmed})
-        remaining_signature=lambda side:sorted((stroke['orientation'],tuple(round(v,5) for v in stroke['bbox']),tuple(signature(stroke['styles']))) for stroke in unresolved_borders[side])
-        if remaining_signature('old')!=remaining_signature('new'):
-            old_remaining,new_remaining=unresolved_borders['old'],unresolved_borders['new']
-            add('format','border_correspondence_unverified','其余线段样式对应待核验',f'{len(old_remaining)} 条未完整对应线段',f'{len(new_remaining)} 条未完整对应线段',
-                '这些线段缺少唯一外框或可靠同文单元格边界锚；两侧定位各自的一处参考线段，不代表两者已对应，不能按最近坐标判定其局部线型变化。',a,b,
-                _source(a,[old_remaining[0]['bbox']],precision='corresponding_region') if old_remaining else _source(a,precision='page'),
-                _source(b,[new_remaining[0]['bbox']],precision='corresponding_region') if new_remaining else _source(b,precision='page'),issue=True,
-                measurements={'unresolved_old_segments':len(old_remaining),'unresolved_new_segments':len(new_remaining),'match_basis':'缺少可靠边界锚，未建立完整对应',
-                              'unresolved_sources':{side:[{'bbox':stroke['bbox'],'orientation':stroke['orientation'],'styles':stroke['styles'],'reason':'未被可靠锚覆盖完整线段'} for stroke in unresolved_borders[side]] for side in ('old','new')}})
-        fills=lambda view:[x for x in view['appearance']['vectors'] if x['fill'] is not None and any(_inside(x['bbox'],r) for r in view['scopes'])]
-        for x,y in _geometry_pairs(fills(a),fills(b)):
-            if x['fill']!=y['fill']:
-                add('format','fill_changed','区域填充颜色',x['fill'],y['fill'],'比较同一几何区域的填充色，区域颜色互换不会被全局集合去重隐藏。',a,b,_source(a,[x['bbox']]),_source(b,[y['bbox']]))
-            elif any(abs(u-v)>.001 for u,v in zip(x['bbox'],y['bbox'])):
-                add('layout','fill_geometry_changed','填充区域位置',_geometry_text(x,ap),_geometry_text(y,bp),'填充区域几何变化。',a,b,_source(a,[x['bbox']]),_source(b,[y['bbox']]))
-        for x,y in _geometry_pairs(a['images'],b['images']):
-            if any(abs(u-v)>.001 for u,v in zip(x['bbox'],y['bbox'])):
-                add('layout','image_position_changed','图片区域位置',_geometry_text(x,ap),_geometry_text(y,bp),'同数量图像仍比较各自位置和物理尺寸。',a,b,_source(a,[x['bbox']]),_source(b,[y['bbox']]))
-        def grid_profile(table):
-            box=table['bbox']
-            return ([round((v-box[0])/max(box[2]-box[0],1e-9),4) for v in sorted({c['bbox'][i] for c in table['cells'] for i in (0,2)})],
-                    [round((v-box[1])/max(box[3]-box[1],1e-9),4) for v in sorted({c['bbox'][i] for c in table['cells'] for i in (1,3)})])
-        for x,y in _geometry_pairs(a['tables'],b['tables']):
-            if x['rows']==y['rows'] and x['columns']==y['columns'] and grid_profile(x)!=grid_profile(y):
-                add('layout','grid_geometry_changed','表内行高与列宽',grid_profile(x),grid_profile(y),'行列数量和外框相同也比较内部网格分割比例；未将不同列宽归一化消除。',a,b,_source(a,[x['bbox']]),_source(b,[y['bbox']]))
-        raster=ap.get('raster_dominant') or bp.get('raster_dominant')
-        if raster:
-            unavailable_dimensions.update(('content', 'format', 'structure'))
-            limits['format'].append('本报表含扫描图像，无法从像素可靠确定字体名称、字号或加粗设置。')
-            limits['structure'].append('扫描结构仅凭视觉区域提示；未将像素线条推断为可靠行列/合并关系。')
-        visual_needed=raster or a['images'] or b['images'] or any(v['kind']=='curve' for p in (ap,bp) for v in p['vectors']) or len(fills(a))!=len(fills(b))
-        if visual_needed:
-            for region in _visual_regions(a, b, residual=not raster):
-                add('layout', 'visual_region_changed', '扫描区域视觉变化', None, None, region['reason'] + '；仅确认视觉证据，文字与字体属性待核验。', a, b,
-                    _source(a,[region['old']]), _source(b,[region['new']]), issue=True)
+            def spacing(side, width):
+                return median((q[side]['char']['bbox'][0] - p[side]['char']['bbox'][2]) * width / max(p[side]['char'].get('size_pt') or 1, 1) for p, q in adjacent)
+            xgap, ygap = spacing(0, ap['width_pt']), spacing(1, bp['width_pt'])
+            if abs(xgap - ygap) > .08:
+                evidence = {**evidence, 'adjacent_gap_count': len(adjacent), 'gap_pairs': [
+                    {side: {'text': [p[index]['text'], q[index]['text']], 'char_ids': [p[index]['char']['id'], q[index]['char']['id']],
+                            'bboxes': [p[index]['char']['bbox'], q[index]['char']['bbox']],
+                            'gap_em': (q[index]['char']['bbox'][0] - p[index]['char']['bbox'][2]) * width / max(p[index]['char'].get('size_pt') or 1, 1)}
+                     for index, side, width in ((0, 'old', ap['width_pt']), (1, 'new', bp['width_pt']))} for p, q in adjacent]}
+                runs = []
+                for p, q in adjacent:
+                    if runs and all(runs[-1][-1][side]['char']['id'] == p[side]['char']['id'] for side in (0, 1)):
+                        runs[-1].append(q)
+                    else:
+                        runs.append([p, q])
+                sources = []
+                for side, view in ((0, a), (1, b)):
+                    source = _text_source(view, [item[side] for run in runs for item in run])
+                    parts = [_text_source(view, [item[side] for item in run]) for run in runs]
+                    boxes = [box for part in parts for box in part.get('highlight_boxes', [part['bbox']])]
+                    if len(boxes) > 1:
+                        source.update(highlight_boxes=boxes, bbox=_union(boxes))
+                    sources.append(source)
+                gaps.append((xgap, ygap, *sources, evidence))
+    if moves:
+        add('layout', 'text_layout_changed', '文字块位置', f'{len(moves)} 个匹配文字区域', f'{len(moves)} 个匹配文字区域',
+            '只在已可靠对应的单元格或段落内测量文字位置；下方定位第一处测量样例。' + (' 页面尺寸/方向也变化。' if page_changed else ''), a, b,
+            moves[0][0], moves[0][1], measurements=moves[0][2])
+    if gaps:
+        add('format', 'character_spacing_changed', '实际字距', f'{gaps[0][0]:.3f} em', f'{gaps[0][1]:.3f} em',
+            f'{len(gaps)} 个可靠单元格或段落内的同行字距测量改变；仅比较两侧原始字符序列中均真实相邻的同一字符对，至少两条共同间隙。下方定位第一处测量样例。', a, b,
+            gaps[0][2], gaps[0][3], measurements=gaps[0][4])
+    page_checks = compare_paragraphs(a, b)
+    paragraph_checks.extend(page_checks)
+    uncertain_paragraphs = []
+    for check in page_checks:
+        if check['status'] == 'changed':
+            attr = check['attribute']
+            add('format', 'paragraph_line_spacing_changed' if attr == 'line_spacing' else 'paragraph_alignment_changed',
+                '有效段落行距（基线）' if attr == 'line_spacing' else '段落几何对齐', check['old_value'], check['new_value'],
+                check['message'], a, b, check['old_source'], check['new_source'], measurements=check['measurements'])
+        elif check['status'] == 'unverified':
+            measurements = check['measurements']
+            left, right = measurements.get('old'), measurements.get('new')
+            field = 'baseline_gaps_pt' if check['attribute'] == 'line_spacing' else 'line_edges_pt'
+            if left and right and field in left and field in right and left[field] != right[field]:
+                uncertain_paragraphs.append(check)
+            elif left is None or right is None:
+                uncertain_paragraphs.append(check)
+            elif measurements.get('native_baselines_unavailable') or '文字提取或 OCR' in check['message'] or '缺少可比较' in check['message']:
+                uncertain_paragraphs.append(check)
+    if uncertain_paragraphs:
+        check = uncertain_paragraphs[0]
+        add('format', 'paragraph_measurement_unverified', '段落属性待核验', check['old_value'], check['new_value'],
+            f'{len(uncertain_paragraphs)} 项段落属性不能确定；详情见逐段检查。' + check['message'], a, b,
+            check['old_source'], check['new_source'], issue=True, measurements=check['measurements'])
+    return format_groups
+
+
+def _compare_page_vectors_and_geometry(a, b, format_groups, add) -> None:
+    """比较单页表格与表单结构、边框线段样式、填充区域、图像位置及网格行列比例。"""
+    ap, bp = a['appearance'], b['appearance']
+    topology = lambda v: sorted((t['rows'], t['columns'], tuple(t['merged_ranges'])) for t in v['tables'])
+    if topology(a) != topology(b):
+        add('structure', 'table_structure_changed', '表格行列与合并结构', topology(a), topology(b), '比较矢量网格恢复的行数、列数和合并范围，包含空白行与空白表单；不依赖业务数值。', a, b)
+    def form_shape(view):
+        free = _free_lines(view)
+        return (len(view['frames']), len(free), len(view['images']))
+    if form_shape(a) != form_shape(b):
+        add('structure', 'form_structure_changed', '空框、填写线及图像结构', form_shape(a), form_shape(b), '依次为闭合外框、框外填写横线、图像数量；已合并相接共线段，不以 PDF 绘图对象数量冒充可见结构数量。', a, b)
+    frame_changes = []
+    for x, y in _geometry_pairs([{'bbox': f} for f in a['frames']], [{'bbox': f} for f in b['frames']]):
+        fa, fb = x['bbox'], y['bbox']
+        before = [round((fa[2] - fa[0]) * ap['width_pt'], 2), round((fa[3] - fa[1]) * ap['height_pt'], 2)]
+        after = [round((fb[2] - fb[0]) * bp['width_pt'], 2), round((fb[3] - fb[1]) * bp['height_pt'], 2)]
+        if max(abs(u - v) for u, v in zip(before, after)) > .5 or max(abs(u - v) for u, v in zip(fa, fb)) > .008:
+            frame_changes.append((fa, fb, before, after))
+    if frame_changes:
+        fa, fb, before, after = frame_changes[0]
+        add('layout', 'form_geometry_changed', '空框尺寸与位置', f'{before[0]} × {before[1]} pt', f'{after[0]} × {after[1]} pt', f'{len(frame_changes)} 个对应闭合表单框的中心线宽高或页边位置变化；宽高取左右纵线、上下横线的中心轴距离，线宽及端点伸缩另计。', a, b, _source(a, [fa]), _source(b, [fb]), measurements={'geometry_basis': '闭合框四边中心轴距离', 'old_bbox': fa, 'new_bbox': fb, 'old_size_pt': before, 'new_size_pt': after})
+    border_pairs, unresolved_borders = _border_correspondence(a, b, format_groups)
+    for x, y, evidence in border_pairs:
+        if evidence['boundary_role'] not in ('before_label', 'after_label', 'isolated_line') or x['orientation'] != 'horizontal':
+            continue
+        if any(abs(u - v) > .001 for u, v in zip(x['bbox'], y['bbox'])) or _geometry_text(x, ap) != _geometry_text(y, bp):
+            add('layout', 'filling_line_geometry_changed', '填写线长度与位置', _geometry_text(x, ap), _geometry_text(y, bp), '填写线按可靠相同字段或唯一孤立线锚比较物理长度与位置，不按全页最近坐标建立对应。', a, b, _source(a, [x['bbox']]), _source(b, [y['bbox']]), measurements=evidence)
+    signature = lambda styles: sorted(_style_text([style]) for style in styles)
+    changed_styles = [(x, y, evidence) for x, y, evidence in border_pairs if signature(x['styles']) != signature(y['styles'])]
+    if changed_styles:
+        x, y, evidence = changed_styles[0]
+        confirmed = [{**basis, 'old': {'bbox': p['bbox'], 'styles': p['styles']}, 'new': {'bbox': q['bbox'], 'styles': q['styles']}, 'style_changed': signature(p['styles']) != signature(q['styles'])} for p, q, basis in border_pairs]
+        add('format', 'border_style_changed', '矢量线宽、线型与颜色', _style_text(x['styles']), _style_text(y['styles']), f'{len(changed_styles)} 个具有可靠边界对应的局部线段样式改变；下方数值与定位仅展示第一处样例，全部已确认对应保留在测量证据中。', a, b, _source(a, [x['bbox']]), _source(b, [y['bbox']]), measurements={**evidence, 'confirmed_changed_segments': len(changed_styles), 'confirmed_pairs': confirmed})
+    remaining_signature = lambda side: sorted((stroke['orientation'], tuple(round(v, 5) for v in stroke['bbox']), tuple(signature(stroke['styles']))) for stroke in unresolved_borders[side])
+    if remaining_signature('old') != remaining_signature('new'):
+        old_remaining, new_remaining = unresolved_borders['old'], unresolved_borders['new']
+        add('format', 'border_correspondence_unverified', '其余线段样式对应待核验', f'{len(old_remaining)} 条未完整对应线段', f'{len(new_remaining)} 条未完整对应线段',
+            '这些线段缺少唯一外框或可靠同文单元格边界锚；两侧定位各自的一处参考线段，不代表两者已对应，不能按最近坐标判定其局部线型变化。', a, b,
+            _source(a, [old_remaining[0]['bbox']], precision='corresponding_region') if old_remaining else _source(a, precision='page'),
+            _source(b, [new_remaining[0]['bbox']], precision='corresponding_region') if new_remaining else _source(b, precision='page'), issue=True,
+            measurements={'unresolved_old_segments': len(old_remaining), 'unresolved_new_segments': len(new_remaining), 'match_basis': '缺少可靠边界锚，未建立完整对应',
+                          'unresolved_sources': {side: [{'bbox': stroke['bbox'], 'orientation': stroke['orientation'], 'styles': stroke['styles'], 'reason': '未被可靠锚覆盖完整线段'} for stroke in unresolved_borders[side]] for side in ('old', 'new')}})
+    for x, y in _geometry_pairs(_filled_vectors(a), _filled_vectors(b)):
+        if x['fill'] != y['fill']:
+            add('format', 'fill_changed', '区域填充颜色', x['fill'], y['fill'], '比较同一几何区域的填充色，区域颜色互换不会被全局集合去重隐藏。', a, b, _source(a, [x['bbox']]), _source(b, [y['bbox']]))
+        elif any(abs(u - v) > .001 for u, v in zip(x['bbox'], y['bbox'])):
+            add('layout', 'fill_geometry_changed', '填充区域位置', _geometry_text(x, ap), _geometry_text(y, bp), '填充区域几何变化。', a, b, _source(a, [x['bbox']]), _source(b, [y['bbox']]))
+    for x, y in _geometry_pairs(a['images'], b['images']):
+        if any(abs(u - v) > .001 for u, v in zip(x['bbox'], y['bbox'])):
+            add('layout', 'image_position_changed', '图片区域位置', _geometry_text(x, ap), _geometry_text(y, bp), '同数量图像仍比较各自位置和物理尺寸。', a, b, _source(a, [x['bbox']]), _source(b, [y['bbox']]))
+    def grid_profile(table):
+        box = table['bbox']
+        return ([round((v - box[0]) / max(box[2] - box[0], 1e-9), 4) for v in sorted({c['bbox'][i] for c in table['cells'] for i in (0, 2)})],
+                [round((v - box[1]) / max(box[3] - box[1], 1e-9), 4) for v in sorted({c['bbox'][i] for c in table['cells'] for i in (1, 3)})])
+    for x, y in _geometry_pairs(a['tables'], b['tables']):
+        if x['rows'] == y['rows'] and x['columns'] == y['columns'] and grid_profile(x) != grid_profile(y):
+            add('layout', 'grid_geometry_changed', '表内行高与列宽', grid_profile(x), grid_profile(y), '行列数量和外框相同也比较内部网格分割比例；未将不同列宽归一化消除。', a, b, _source(a, [x['bbox']]), _source(b, [y['bbox']]))
+
+
+def _compare_page_visual_residual(a, b, add, limits, unavailable_dimensions) -> None:
+    """检查扫描图像占比与非文本/残差区域的视觉变化。"""
+    ap, bp = a['appearance'], b['appearance']
+    raster = ap.get('raster_dominant') or bp.get('raster_dominant')
+    if raster:
+        unavailable_dimensions.update(('content', 'format', 'structure'))
+        limits['format'].append('本报表含扫描图像，无法从像素可靠确定字体名称、字号或加粗设置。')
+        limits['structure'].append('扫描结构仅凭视觉区域提示；未将像素线条推断为可靠行列/合并关系。')
+    visual_needed = raster or a['images'] or b['images'] or any(v['kind'] == 'curve' for p in (ap, bp) for v in p['vectors']) or len(_filled_vectors(a)) != len(_filled_vectors(b))
+    if visual_needed:
+        for region in _visual_regions(a, b, residual=not raster):
+            add('layout', 'visual_region_changed', '扫描区域视觉变化', None, None, region['reason'] + '；仅确认视觉证据，文字与字体属性待核验。', a, b,
+                _source(a, [region['old']]), _source(b, [region['new']]), issue=True)
+
+
+def compare_report_appearance(old_book, new_book, entry, *, overlays_by_side=None):
+    diffs = []
+    paragraph_checks = []
+    limits = {category: [] for category in _CATEGORIES}
+    unavailable_dimensions = set()
+    if overlays_by_side is None:
+        overlays_by_side = {'old': index_page_overlays(old_book), 'new': index_page_overlays(new_book)}
+    old, missing_old = _page_views(old_book, entry.get('old') or {}, overlays_by_side['old'])
+    new, missing_new = _page_views(new_book, entry.get('new') or {}, overlays_by_side['new'])
+    pairs = _pair_pages(old, new)
+
+    def add(category, kind, field, before, after, message, a=None, b=None, old_source=None, new_source=None, issue=False, delta=None, measurements=None):
+        source_a = old_source or (_source(a) if a else None)
+        source_b = new_source or (_source(b) if b else None)
+        diffs.append({'id': f'appearance-{len(diffs) + 1:05d}', 'kind': kind, 'table_id': entry['id'], 'table_name': entry.get('title', '完整报表'),
+                      'row_key': f"旧第 {a['number']} 页 / 新第 {b['number']} 页" if a and b else '完整报表', 'field': field,
+                      'old_value': None if before is None else str(before), 'new_value': None if after is None else str(after), 'delta': delta,
+                      'message': message, 'severity': 'issue' if issue else 'change', 'old_source': source_a, 'new_source': source_b,
+                      'category': category, 'layer': 'uncertainty' if issue else category, 'report_id': entry['id']})
+        if measurements is not None:
+            diffs[-1]['measurements'] = measurements
+
+    pairs = _validate_report_pairing(old, new, missing_old, missing_new, entry, pairs, add, unavailable_dimensions)
+    # 必须按 pairs 逐页顺次执行四阶段比较，保证 diffs 编号、顺序与 limitations 首次插入序严格一致
+    for a, b, basis, state in pairs:
+        page_changed = _compare_page_pairing_and_canvas(a, b, basis, state, add, limits, unavailable_dimensions)
+        if page_changed is None:
+            continue
+        format_groups = _compare_page_text_and_paragraphs(a, b, entry, page_changed, add, limits, unavailable_dimensions, paragraph_checks)
+        _compare_page_vectors_and_geometry(a, b, format_groups, add)
+        _compare_page_visual_residual(a, b, add, limits, unavailable_dimensions)
     content_old = list({v['number']: v for a,b,_,state in pairs if state == 'confirmed' for v in [a] if v}.values())
     content_new = list({v['number']: v for a,b,_,state in pairs if state == 'confirmed' for v in [b] if v}.values())
     for arguments in _content_changes(content_old, content_new, entry, {(a['number'],b['number']) for a,b,_,state in pairs if a and b and state=='confirmed'}):

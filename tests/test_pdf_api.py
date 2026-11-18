@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 from reportlab.pdfgen import canvas
 from scripts.make_pdf_examples import register_font
 
-from backend.app import create_app
+from backend.app import create_app, encode, public_pdf_pages
 
 
 def text_pdf(amount="12000", password=None):
@@ -56,7 +56,18 @@ def test_pdf_upload_compare_page_highlight_export_and_original(client):
     assert job["kind"] == "pdf"
     assert job["files"]["old"]["sha256"] == hashlib.sha256(old).hexdigest()
     assert len(job["files"]["old"]["pages"]) == 1
+    refreshed_job = client.get(f"/api/jobs/{job['id']}").json()
+    for metadata in (job, refreshed_job):
+        public_page = metadata["files"]["old"]["pages"][0]
+        assert public_page["has_native_text"] is True
+        assert all("cell_geometry" not in sheet for sheet in metadata["files"]["old"]["sheets"])
+        assert not {"appearance", "native_lines", "native_text", "evidence_lines", "appearance_path"} & public_page.keys()
+    original_book = client.app.state.store.workbook(job["id"], "old")
+    assert original_book["pages"][0]["native_lines"]
+    assert any(sheet.get("cell_geometry") for sheet in original_book["sheets"])
     run = compare_pdf(client, job)
+    assert run["review_pages"]["old"][0]["has_native_text"] is True
+    assert "native_lines" not in run["review_pages"]["old"][0]
     diffs = client.get(f"/api/runs/{run['id']}/diffs").json()["items"]
     amount = next(d for d in diffs if d["old_value"] == "12000" and d["new_value"] == "12800")
     assert amount["delta"] == "800"
@@ -194,3 +205,52 @@ def test_small_scan_table_below_native_heading_is_not_skipped(client):
         book = client.app.state.store.workbook(job["id"], side)
         assert any(c["display"] == expected and c["pdf_source"]["method"] == "ocr" for sh in book["sheets"] for c in sh["cells"].values())
         assert any(c["pdf_source"]["method"] == "text" and "Native heading" in c["display"] for sh in book["sheets"] for c in sh["cells"].values())
+
+
+def test_public_pdf_pages_keeps_viewer_metadata_without_text_or_storage_details():
+    page = {
+        "number": 1, "width": 400, "height": 300, "physical_width": 400, "physical_height": 300,
+        "image_width": 800, "image_height": 600, "method": "ocr", "status": "ok",
+        "reviewed": False, "reviewable": True, "reviewed_cells": 1, "total_cells": 2,
+        "structure_unconfirmed": False, "blank": False, "rotation": 0,
+        "native_lines": [{"text": "Native heading"}], "native_text": "Native heading",
+        "evidence_lines": [{"text": "Extracted content"}], "appearance": {"chars": ["private"]},
+        "ocr_regions": [{"text": "Recognized content"}], "ocr_annotations": [{"text": "Annotation"}],
+        "appearance_path": "/private/appearance.json", "image_path": "/private/page.png",
+        "future_internal_payload": {"text": "Do not expose"},
+    }
+    result = public_pdf_pages({"pages": [page]})[0]
+    assert result == {key: value for key, value in page.items() if key in {
+        "number", "width", "height", "physical_width", "physical_height", "image_width", "image_height",
+        "method", "status", "reviewed", "reviewable", "reviewed_cells", "total_cells",
+        "structure_unconfirmed", "blank", "rotation",
+    }} | {"has_native_text": True}
+    assert page["native_text"] == "Native heading" and page["appearance_path"] == "/private/appearance.json"
+    assert public_pdf_pages({"pages": [{"number": 2, "method": "ocr"}]}) == [
+        {"number": 2, "method": "ocr", "has_native_text": False}]
+
+
+def test_unmodified_pdf_job_uses_saved_metadata_without_loading_evidence(client, monkeypatch):
+    from unittest.mock import Mock
+
+    original = text_pdf()
+    uploaded = upload_pdf(client, original, original)
+    store = client.app.state.store
+    legacy_metadata = store.job(uploaded["id"])
+    for side in ("old", "new"):
+        for sheet in legacy_metadata["files"][side]["sheets"]:
+            sheet["cell_geometry"] = [{"internal_geometry": "large legacy payload"}]
+    with store.connect() as db:
+        db.execute("UPDATE jobs SET metadata=? WHERE id=?", (encode(legacy_metadata), uploaded["id"]))
+    read_job = Mock(wraps=store.job)
+    monkeypatch.setattr(store, "job", read_job)
+    for name in ("workbook", "reviewed_book", "reviews"):
+        monkeypatch.setattr(store, name, Mock(side_effect=AssertionError("must not reload PDF evidence")))
+    response = client.get(f"/api/jobs/{uploaded['id']}")
+    assert response.status_code == 200, response.text
+    current = response.json()
+    assert current["suggested_pairs"] == uploaded["suggested_pairs"]
+    assert current["files"] == uploaded["files"]
+    assert current["warnings"] == uploaded["warnings"]
+    assert current["review_revision"] == current["structure_revision"] == 0
+    read_job.assert_called_once_with(uploaded["id"])

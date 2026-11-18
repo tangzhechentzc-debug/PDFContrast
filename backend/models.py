@@ -34,7 +34,7 @@ class PairConfig(BaseModel):
 
 class CompareConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    pairs: list[PairConfig] = Field(default_factory=list, max_length=200)
+    pairs: list[PairConfig] = Field(default_factory=list, max_length=5000)
     absolute_tolerance: str = "0"
     ignore_outer_whitespace: bool = True
     compare_formulas: bool = True

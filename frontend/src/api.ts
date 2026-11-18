@@ -25,6 +25,10 @@ export function messageOf(error: unknown): string {
 }
 
 export const kindLabels: Record<string, string> = {
+  business_value_changed: '业务字段变化',
+  business_row_added: '新增业务项目',
+  business_row_removed: '删除业务项目',
+  business_issue: '业务数据待核对',
   text_changed: '文字变化',
   text_whitespace_changed: '空格变化',
   line_break_changed: '换行变化',
@@ -35,10 +39,13 @@ export const kindLabels: Record<string, string> = {
   character_spacing_changed: '字间距变化',
   border_style_changed: '边框样式变化',
   border_correspondence_unverified: '线段对应待核验',
+  fill_changed: '区域填充颜色变化',
   table_structure_changed: '表格行列与合并变化',
+  grid_geometry_changed: '表内行高与列宽变化',
   form_structure_changed: '表单框结构变化',
   form_geometry_changed: '表单框尺寸与位置变化',
   filling_line_geometry_changed: '填写线尺寸与位置变化',
+  fill_geometry_changed: '填充区域位置变化',
   page_size_changed: '纸张尺寸变化',
   page_orientation_changed: '纸张横竖变化',
   page_rotation_changed: '页面旋转变化',
@@ -49,6 +56,7 @@ export const kindLabels: Record<string, string> = {
   page_order_changed: '页面顺序变化',
   report_page_added: '报表新增页',
   report_page_removed: '报表删除页',
+  image_position_changed: '图片区域位置变化',
   visual_region_changed: '图像区域变化',
   text_extraction_unverified: '文字提取待核验',
   page_pairing_unverified: '页面配对待确认',
@@ -58,7 +66,6 @@ export const kindLabels: Record<string, string> = {
   paragraph_measurement_unverified: '段落测量未验证',
   report_added: '新增业务报表',
   report_removed: '业务报表缺失',
-  report_uncertain: '业务报表待确认',
   report_review: '报表对应与提取待确认',
   attribute_unverified: '属性验证未完成',
   value_changed: '内容变化',
@@ -111,3 +118,6 @@ import type { Source } from './types';
 
 export const dimensionLabels = { content: '内容', structure: '结构', format: '格式', layout: '版式' } as const;
 export const dimensionStatusLabels = { changed: '有变化', unchanged: '未发现变化', partial: '部分可比', unverified: '待核验 / 未完成', not_applicable: '不可比较 / 不适用' } as const;
+
+export const categoryLabels = { ...dimensionLabels, business: '业务数据' } as const;
+export const businessStatusLabels = { changed: '有变化', unchanged: '未发现数值或业务字段变化', pending: '部分可比 / 待核对' } as const;
